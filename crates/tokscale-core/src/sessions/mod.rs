@@ -7,6 +7,7 @@ pub mod antigravity;
 pub mod claudecode;
 pub mod codebuff;
 pub mod codex;
+pub mod codex_account;
 pub mod copilot;
 pub mod crush;
 pub mod cursor;
@@ -43,11 +44,59 @@ pub struct UnifiedMessage {
     #[serde(default = "default_message_count")]
     pub message_count: i32,
     pub agent: Option<String>,
+    #[serde(default)]
+    pub codex_account_hash: Option<String>,
     pub dedup_key: Option<String>,
+    #[serde(default)]
+    pub generation_duration_ms: Option<u64>,
     /// True if this message is the first assistant response after a user turn.
     /// Used to count user interaction turns (as opposed to API message count).
     #[serde(default)]
     pub is_turn_start: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CodexQuotaSample {
+    pub client: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub codex_account_hash: Option<String>,
+    pub timestamp: i64,
+    pub date: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub window_kind: String,
+    pub used_percent: f64,
+    pub window_minutes: i64,
+    pub resets_at: i64,
+}
+
+impl CodexQuotaSample {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: impl Into<String>,
+        timestamp: i64,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        window_kind: impl Into<String>,
+        used_percent: f64,
+        window_minutes: i64,
+        resets_at: i64,
+    ) -> Self {
+        Self {
+            client: "codex".to_string(),
+            session_id: session_id.into(),
+            codex_account_hash: None,
+            timestamp,
+            date: timestamp_to_date(timestamp),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            window_kind: window_kind.into(),
+            used_percent,
+            window_minutes,
+            resets_at,
+        }
+    }
 }
 
 const fn default_message_count() -> i32 {
@@ -284,7 +333,9 @@ impl UnifiedMessage {
             cost,
             message_count: default_message_count(),
             agent,
+            codex_account_hash: None,
             dedup_key,
+            generation_duration_ms: None,
             is_turn_start: false,
         }
     }

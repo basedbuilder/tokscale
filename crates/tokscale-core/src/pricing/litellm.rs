@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const CACHE_FILENAME: &str = "pricing-litellm.json";
+// Pinned to a reviewed LiteLLM commit instead of the mutable main branch.
 const PRICING_URL: &str =
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+    "https://raw.githubusercontent.com/BerriAI/litellm/26fcbc93e52d8f212f818d53c6922a0fdddb4d48/model_prices_and_context_window.json";
 const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 200;
 

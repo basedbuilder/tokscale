@@ -43,6 +43,26 @@ pub fn format_cost(cost: f64) -> String {
     }
 }
 
+pub fn format_price_per_million(price: Option<f64>) -> String {
+    let Some(price) = price else {
+        return "—".to_string();
+    };
+    if !price.is_finite() || price < 0.0 {
+        return "—".to_string();
+    }
+    if price >= 1000.0 {
+        format!("${:.1}K", price / 1000.0)
+    } else if price >= 10.0 {
+        format!("${:.2}", price)
+    } else if price >= 1.0 {
+        format!("${:.3}", price)
+    } else if price >= 0.01 {
+        format!("${:.4}", price)
+    } else {
+        format!("${:.5}", price)
+    }
+}
+
 /// Cache reuse multiplier: cached reads per full-price input token.
 /// `cache_read / (input + cache_write)` — how many low-cost reads you
 /// got for every token you paid full price (fresh input or cache write).

@@ -6,7 +6,7 @@
 use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
 };
-use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
+use super::{normalize_workspace_key, workspace_label_from_key, CodexQuotaSample, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,6 +24,7 @@ pub struct CodexEntry {
 
 #[derive(Debug, Deserialize)]
 pub struct CodexPayload {
+    pub id: Option<String>,
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
     pub model: Option<String>,
@@ -37,6 +38,20 @@ pub struct CodexPayload {
     pub model_provider: Option<String>,
     /// Agent name from session_meta
     pub agent_nickname: Option<String>,
+    pub rate_limits: Option<CodexRateLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CodexRateLimits {
+    pub primary: Option<CodexRateLimitWindow>,
+    pub secondary: Option<CodexRateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CodexRateLimitWindow {
+    pub used_percent: Option<f64>,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,6 +164,7 @@ impl CodexTotals {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CodexParseState {
+    pub session_id: Option<String>,
     pub current_model: Option<String>,
     pub previous_totals: Option<CodexTotals>,
     pub session_is_headless: bool,
@@ -156,11 +172,14 @@ pub(crate) struct CodexParseState {
     pub session_agent: Option<String>,
     pub session_workspace_key: Option<String>,
     pub session_workspace_label: Option<String>,
+    pub pending_turn_start: bool,
+    pub generation_start_timestamp: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedCodexFile {
     pub messages: Vec<UnifiedMessage>,
+    pub quota_samples: Vec<CodexQuotaSample>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub consumed_offset: u64,
     pub parse_succeeded: bool,
@@ -174,6 +193,16 @@ fn session_id_from_path(path: &Path) -> String {
         .to_string()
 }
 
+fn is_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.chars().enumerate().all(|(index, ch)| match index {
+        8 | 13 | 18 | 23 => ch == '-',
+        _ => ch.is_ascii_hexdigit(),
+    })
+}
+
 fn parse_codex_reader<R: BufRead>(
     mut reader: R,
     session_id: &str,
@@ -182,15 +211,16 @@ fn parse_codex_reader<R: BufRead>(
     mut state: CodexParseState,
 ) -> ParsedCodexFile {
     let mut messages = Vec::with_capacity(64);
+    let mut quota_samples = Vec::new();
     let mut fallback_timestamp_indices = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
-    let mut line = String::with_capacity(4096);
+    let mut line = Vec::with_capacity(4096);
     let mut consumed_offset = start_offset;
     let mut parse_succeeded = true;
 
     loop {
         line.clear();
-        let bytes_read = match reader.read_line(&mut line) {
+        let bytes_read = match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
             Ok(bytes_read) => bytes_read,
             Err(_) => {
@@ -200,17 +230,36 @@ fn parse_codex_reader<R: BufRead>(
         };
         consumed_offset += bytes_read as u64;
 
-        let trimmed = line.trim();
+        let trimmed = trim_ascii_bytes(&line);
         if trimmed.is_empty() {
+            continue;
+        }
+        let event_kind = classify_codex_usage_line(trimmed);
+        let looks_relevant = event_kind != CodexUsageLineKind::Irrelevant;
+        if !state.session_is_headless && !looks_relevant {
+            if trimmed.len() < 1024 && std::str::from_utf8(trimmed).is_err() {
+                parse_succeeded = false;
+                break;
+            }
+            continue;
+        }
+        if event_kind == CodexUsageLineKind::UserMessage {
+            state.pending_turn_start = true;
+            state.generation_start_timestamp = parse_codex_entry_timestamp(trimmed);
             continue;
         }
 
         let mut handled = false;
         buffer.clear();
-        buffer.extend_from_slice(trimmed.as_bytes());
+        buffer.extend_from_slice(trimmed);
         if let Ok(entry) = simd_json::from_slice::<CodexEntry>(&mut buffer) {
             if let Some(payload) = entry.payload {
                 if entry.entry_type == "session_meta" {
+                    if let Some(ref id) = payload.id {
+                        if is_uuid(id) {
+                            state.session_id = Some(id.clone());
+                        }
+                    }
                     if payload.source.as_deref() == Some("exec") {
                         state.session_is_headless = true;
                     }
@@ -234,6 +283,37 @@ fn parse_codex_reader<R: BufRead>(
                     handled = true;
                 }
 
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("user_message")
+                {
+                    state.pending_turn_start = true;
+                    state.generation_start_timestamp = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_timestamp_ms);
+                    handled = true;
+                }
+
+                if entry.entry_type == "event_msg"
+                    && payload.payload_type.as_deref() == Some("task_started")
+                {
+                    state.generation_start_timestamp = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_timestamp_ms);
+                    handled = true;
+                }
+
+                if entry.entry_type == "response_item"
+                    && payload.payload_type.as_deref() == Some("function_call_output")
+                {
+                    state.generation_start_timestamp = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_timestamp_ms);
+                    handled = true;
+                }
+
                 // Process token_count events
                 if entry.entry_type == "event_msg"
                     && payload.payload_type.as_deref() == Some("token_count")
@@ -241,6 +321,39 @@ fn parse_codex_reader<R: BufRead>(
                     // Try to extract model from payload
                     if let Some(model) = extract_model(&payload) {
                         state.current_model = Some(model);
+                    }
+
+                    let parsed_timestamp = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_timestamp_ms);
+                    let provider = state.session_provider.as_deref().unwrap_or("openai");
+                    let effective_session_id = state.session_id.as_deref().unwrap_or(session_id);
+                    let model = state
+                        .current_model
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if let (Some(timestamp), Some(rate_limits)) =
+                        (parsed_timestamp, payload.rate_limits.as_ref())
+                    {
+                        push_rate_limit_sample(
+                            &mut quota_samples,
+                            effective_session_id,
+                            timestamp,
+                            provider,
+                            &model,
+                            "primary",
+                            rate_limits.primary.as_ref(),
+                        );
+                        push_rate_limit_sample(
+                            &mut quota_samples,
+                            effective_session_id,
+                            timestamp,
+                            provider,
+                            &model,
+                            "secondary",
+                            rate_limits.secondary.as_ref(),
+                        );
                     }
 
                     let info = match payload.info {
@@ -317,13 +430,22 @@ fn parse_codex_reader<R: BufRead>(
                         continue;
                     }
 
-                    state.previous_totals = next_totals;
-
-                    let parsed_timestamp = entry
-                        .timestamp
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-                        .map(|dt| dt.timestamp_millis());
                     let timestamp = parsed_timestamp.unwrap_or(fallback_timestamp);
+                    let generated_tokens = tokens.output.saturating_add(tokens.reasoning);
+                    let generation_duration_ms =
+                        if generated_tokens > 0 && parsed_timestamp.is_some() {
+                            state
+                                .generation_start_timestamp
+                                .and_then(|previous| timestamp.checked_sub(previous))
+                                .and_then(|duration| (duration > 0).then_some(duration as u64))
+                        } else {
+                            None
+                        };
+
+                    state.previous_totals = next_totals;
+                    if parsed_timestamp.is_some() {
+                        state.generation_start_timestamp = Some(timestamp);
+                    }
 
                     let agent = if state.session_is_headless {
                         Some("headless".to_string())
@@ -337,7 +459,7 @@ fn parse_codex_reader<R: BufRead>(
                         "codex",
                         model,
                         provider,
-                        session_id.to_string(),
+                        effective_session_id.to_string(),
                         timestamp,
                         tokens,
                         0.0,
@@ -347,6 +469,11 @@ fn parse_codex_reader<R: BufRead>(
                         state.session_workspace_key.clone(),
                         state.session_workspace_label.clone(),
                     );
+                    message.generation_duration_ms = generation_duration_ms;
+                    if state.pending_turn_start {
+                        message.is_turn_start = true;
+                        state.pending_turn_start = false;
+                    }
                     messages.push(message);
                     if parsed_timestamp.is_none() {
                         fallback_timestamp_indices.push(messages.len() - 1);
@@ -365,6 +492,10 @@ fn parse_codex_reader<R: BufRead>(
             continue;
         }
 
+        let Ok(trimmed) = std::str::from_utf8(trimmed) else {
+            parse_succeeded = false;
+            break;
+        };
         if let Some((mut msg, used_fallback_timestamp)) = parse_codex_headless_line(
             trimmed,
             session_id,
@@ -387,11 +518,116 @@ fn parse_codex_reader<R: BufRead>(
 
     ParsedCodexFile {
         messages,
+        quota_samples,
         fallback_timestamp_indices,
         consumed_offset,
         parse_succeeded,
         state,
     }
+}
+
+fn trim_ascii_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexUsageLineKind {
+    Irrelevant,
+    UserMessage,
+    Relevant,
+}
+
+fn classify_codex_usage_line(line: &[u8]) -> CodexUsageLineKind {
+    let header = &line[..line.len().min(2048)];
+    if contains_bytes(header, br#""type":"user_message""#) {
+        CodexUsageLineKind::UserMessage
+    } else if contains_bytes(header, br#""type":"token_count""#)
+        || contains_bytes(header, br#""type":"session_meta""#)
+        || contains_bytes(header, br#""type":"turn_context""#)
+        || contains_bytes(header, br#""type":"turn.completed""#)
+        || contains_bytes(header, br#""type":"result""#)
+        || contains_bytes(header, br#""type":"task_started""#)
+        || contains_bytes(header, br#""type":"function_call_output""#)
+    {
+        CodexUsageLineKind::Relevant
+    } else {
+        CodexUsageLineKind::Irrelevant
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn parse_rfc3339_timestamp_ms(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+fn parse_codex_entry_timestamp(line: &[u8]) -> Option<i64> {
+    let value: Value = serde_json::from_slice(line).ok()?;
+    value
+        .get("timestamp")
+        .and_then(|timestamp| timestamp.as_str())
+        .and_then(parse_rfc3339_timestamp_ms)
+}
+
+fn push_rate_limit_sample(
+    samples: &mut Vec<CodexQuotaSample>,
+    session_id: &str,
+    timestamp: i64,
+    provider: &str,
+    model: &str,
+    window_kind: &str,
+    window: Option<&CodexRateLimitWindow>,
+) {
+    let Some(window) = window else {
+        return;
+    };
+    let (Some(used_percent), Some(window_minutes), Some(resets_at)) =
+        (window.used_percent, window.window_minutes, window.resets_at)
+    else {
+        return;
+    };
+    if !used_percent.is_finite() || window_minutes <= 0 || resets_at <= 0 {
+        return;
+    }
+
+    let sample = CodexQuotaSample::new(
+        session_id.to_string(),
+        timestamp,
+        provider.to_string(),
+        model.to_string(),
+        window_kind.to_string(),
+        used_percent,
+        window_minutes,
+        resets_at,
+    );
+
+    if let Some(existing) = samples.iter_mut().rev().find(|existing| {
+        existing.window_kind == sample.window_kind
+            && existing.window_minutes == sample.window_minutes
+            && existing.resets_at == sample.resets_at
+    }) {
+        if existing.used_percent == sample.used_percent {
+            *existing = sample;
+            return;
+        }
+    }
+
+    samples.push(sample);
 }
 
 /// Parse a Codex JSONL file with stateful tracking
@@ -424,6 +660,7 @@ pub(crate) fn parse_codex_file_incremental(
         Err(_) => {
             return ParsedCodexFile {
                 messages: Vec::new(),
+                quota_samples: Vec::new(),
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: start_offset,
                 parse_succeeded: false,
@@ -435,6 +672,7 @@ pub(crate) fn parse_codex_file_incremental(
     if file.seek(SeekFrom::Start(start_offset)).is_err() {
         return ParsedCodexFile {
             messages: Vec::new(),
+            quota_samples: Vec::new(),
             fallback_timestamp_indices: Vec::new(),
             consumed_offset: start_offset,
             parse_succeeded: false,
@@ -628,10 +866,19 @@ mod tests {
 
     impl BufRead for FailAfterFirstLine {
         fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.fail_next_read {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "synthetic line decode failure",
+                ));
+            }
             self.inner.fill_buf()
         }
 
         fn consume(&mut self, amt: usize) {
+            if amt > 0 {
+                self.fail_next_read = true;
+            }
             self.inner.consume(amt);
         }
 
@@ -736,6 +983,80 @@ mod tests {
                 Some("/Users/alice/codex-demo")
             ]
         );
+    }
+
+    #[test]
+    fn test_session_meta_id_overrides_filename_session_id() {
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"id":"019dc808-1111-7222-8333-944455556666","source":"chat","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}},"rate_limits":{"secondary":{"used_percent":2.25,"window_minutes":10080,"resets_at":1767834000000}}}}"#,
+            "\n"
+        );
+        let reader = Cursor::new(content.as_bytes());
+
+        let parsed = parse_codex_reader(
+            reader,
+            "filename-without-conversation-id",
+            0,
+            0,
+            CodexParseState::default(),
+        );
+
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(
+            parsed.messages[0].session_id,
+            "019dc808-1111-7222-8333-944455556666"
+        );
+        assert_eq!(parsed.quota_samples.len(), 1);
+        assert_eq!(
+            parsed.quota_samples[0].session_id,
+            "019dc808-1111-7222-8333-944455556666"
+        );
+    }
+
+    #[test]
+    fn test_token_count_rate_limits_emit_quota_samples_without_usage_info() {
+        let content = concat!(
+            r#"{"type":"session_meta","payload":{"source":"chat","model_provider":"openai"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.5,"window_minutes":300,"resets_at":1767229200},"secondary":{"used_percent":2.25,"window_minutes":10080,"resets_at":1767834000}}}}"#,
+            "\n"
+        );
+        let file = create_test_file(content);
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+
+        assert!(parsed.messages.is_empty());
+        assert_eq!(parsed.quota_samples.len(), 2);
+        assert!(!parsed.quota_samples[0].session_id.is_empty());
+        assert_eq!(parsed.quota_samples[0].provider_id, "openai");
+        assert_eq!(parsed.quota_samples[0].model_id, "gpt-5.4");
+        assert_eq!(parsed.quota_samples[0].window_kind, "primary");
+        assert_eq!(parsed.quota_samples[0].used_percent, 12.5);
+        assert_eq!(parsed.quota_samples[0].window_minutes, 300);
+        assert_eq!(parsed.quota_samples[0].resets_at, 1_767_229_200);
+        assert_eq!(parsed.quota_samples[1].window_kind, "secondary");
+        assert_eq!(parsed.quota_samples[1].used_percent, 2.25);
+    }
+
+    #[test]
+    fn test_token_count_rate_limits_require_explicit_timestamp() {
+        let content = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12.5,"window_minutes":300,"resets_at":1767229200000}}}}"#,
+            "\n"
+        );
+        let file = create_test_file(content);
+
+        let parsed = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+
+        assert!(parsed.quota_samples.is_empty());
     }
 
     #[test]
@@ -1194,5 +1515,82 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "gpt-4o");
+    }
+
+    #[test]
+    fn test_user_message_marks_next_token_count_as_turn_start() {
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#;
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].is_turn_start);
+    }
+
+    #[test]
+    fn test_user_message_marks_only_first_following_token_count_as_turn_start() {
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#;
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#;
+        let line4 = r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":0}}}}"#;
+        let content = format!("{}\n{}\n{}\n{}", line1, line2, line3, line4);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].is_turn_start);
+        assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn test_duplicate_token_count_does_not_consume_pending_turn_start() {
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.4"}}"#;
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#;
+        let line4 = r#"{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#;
+        let line5 = r#"{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":0}}}}"#;
+        let content = format!("{}\n{}\n{}\n{}\n{}", line1, line2, line3, line4, line5);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].is_turn_start);
+        assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn test_generation_duration_uses_only_token_count_deltas_with_generated_tokens() {
+        let content = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4-thinking-high"}}
+{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":5}}}}
+{"timestamp":"2026-01-01T00:00:11Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"cached_input_tokens":10,"output_tokens":0,"reasoning_output_tokens":0}}}}
+{"timestamp":"2026-01-01T00:00:13Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"cached_input_tokens":0,"output_tokens":20,"reasoning_output_tokens":0}}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].generation_duration_ms, None);
+        assert_eq!(messages[1].generation_duration_ms, None);
+        assert_eq!(messages[2].generation_duration_ms, Some(2_000));
+    }
+
+    #[test]
+    fn test_generation_duration_resets_after_tool_output() {
+        let content = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"call_1"}}
+{"timestamp":"2026-01-01T00:00:32Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"done"}}
+{"timestamp":"2026-01-01T00:00:34Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":0}}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].generation_duration_ms, Some(2_000));
     }
 }

@@ -15,10 +15,10 @@ pub use aggregator::*;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
 pub use parser::*;
 pub use scanner::*;
-pub use sessions::UnifiedMessage;
+pub use sessions::{CodexQuotaSample, UnifiedMessage};
 
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -214,6 +214,81 @@ pub struct LocalParseOptions {
     pub scanner_settings: scanner::ScannerSettings,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ParsedLocalUsage {
+    pub messages: Vec<UnifiedMessage>,
+    pub quota_samples: Vec<CodexQuotaSample>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DateFilter {
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+}
+
+impl DateFilter {
+    fn from_report_options(options: &ReportOptions) -> Option<Self> {
+        Self::new(
+            options.since.clone(),
+            options.until.clone(),
+            options.year.clone(),
+        )
+    }
+
+    fn from_local_options(options: &LocalParseOptions) -> Option<Self> {
+        Self::new(
+            options.since.clone(),
+            options.until.clone(),
+            options.year.clone(),
+        )
+    }
+
+    fn new(since: Option<String>, until: Option<String>, year: Option<String>) -> Option<Self> {
+        (since.is_some() || until.is_some() || year.is_some()).then_some(Self {
+            since,
+            until,
+            year,
+        })
+    }
+
+    fn includes_date(&self, date: &str) -> bool {
+        if let Some(year) = &self.year {
+            if !date.starts_with(&format!("{year}-")) {
+                return false;
+            }
+        }
+        if let Some(since) = &self.since {
+            if date < since.as_str() {
+                return false;
+            }
+        }
+        if let Some(until) = &self.until {
+            if date > until.as_str() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn ledger_ts_range(&self) -> (Option<i64>, Option<i64>) {
+        let since_date = self
+            .since
+            .clone()
+            .or_else(|| self.year.as_ref().map(|year| format!("{year}-01-01")));
+        let until_date = self
+            .until
+            .clone()
+            .or_else(|| self.year.as_ref().map(|year| format!("{year}-12-31")));
+        let since = since_date
+            .as_deref()
+            .and_then(date_start_timestamp)
+            .map(|timestamp| timestamp);
+        let until = until_date.as_deref().and_then(date_end_timestamp);
+        (since, until)
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct DailyTotals {
     pub tokens: i64,
@@ -389,6 +464,7 @@ fn parse_all_messages_with_pricing(
         pricing,
         true,
         &scanner::ScannerSettings::default(),
+        None,
     )
 }
 
@@ -398,10 +474,33 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     pricing: Option<&pricing::PricingService>,
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
+    date_filter: Option<&DateFilter>,
 ) -> Vec<UnifiedMessage> {
+    parse_all_usage_with_pricing_with_env_strategy(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        date_filter,
+        false,
+    )
+    .messages
+}
+
+fn parse_all_usage_with_pricing_with_env_strategy(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    date_filter: Option<&DateFilter>,
+    include_codex_account_ledger: bool,
+) -> ParsedLocalUsage {
     #[derive(Debug)]
     struct CachedParseOutcome {
         messages: Vec<UnifiedMessage>,
+        quota_samples: Vec<CodexQuotaSample>,
         cache_entry: Option<message_cache::CachedSourceEntry>,
     }
 
@@ -424,6 +523,10 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         messages
     }
 
+    fn cached_quota_samples(cached: &message_cache::CachedSourceEntry) -> Vec<CodexQuotaSample> {
+        cached.quota_samples.clone()
+    }
+
     fn parse_uncached_messages<F>(
         path: &Path,
         pricing: Option<&pricing::PricingService>,
@@ -436,6 +539,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         apply_pricing_to_messages(&mut messages, pricing);
         CachedParseOutcome {
             messages,
+            quota_samples: Vec::new(),
             cache_entry: None,
         }
     }
@@ -444,6 +548,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         path: &Path,
         pricing: Option<&pricing::PricingService>,
         is_headless: bool,
+        cache_enabled: bool,
     ) -> CachedParseOutcome {
         let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
         let parsed = sessions::codex::parse_codex_file_incremental(
@@ -451,30 +556,58 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             0,
             sessions::codex::CodexParseState::default(),
         );
-        let messages = finalize_codex_messages(
-            parsed.messages.clone(),
-            pricing,
-            is_headless,
-            &parsed.fallback_timestamp_indices,
-            fallback_timestamp,
-        );
-        if !parsed.parse_succeeded {
+
+        let sessions::codex::ParsedCodexFile {
+            messages: raw_messages,
+            quota_samples,
+            fallback_timestamp_indices,
+            consumed_offset,
+            parse_succeeded,
+            state,
+        } = parsed;
+
+        if !cache_enabled {
+            let messages = finalize_codex_messages(
+                raw_messages,
+                pricing,
+                is_headless,
+                &fallback_timestamp_indices,
+                fallback_timestamp,
+            );
             return CachedParseOutcome {
                 messages,
+                quota_samples,
+                cache_entry: None,
+            };
+        }
+
+        let messages = finalize_codex_messages(
+            raw_messages.clone(),
+            pricing,
+            is_headless,
+            &fallback_timestamp_indices,
+            fallback_timestamp,
+        );
+        if !parse_succeeded {
+            return CachedParseOutcome {
+                messages,
+                quota_samples,
                 cache_entry: None,
             };
         }
 
         let cache_entry = build_codex_cache_entry(
             path,
-            parsed.messages,
-            parsed.consumed_offset,
-            parsed.state,
-            parsed.fallback_timestamp_indices,
+            raw_messages,
+            quota_samples.clone(),
+            consumed_offset,
+            state,
+            fallback_timestamp_indices,
         );
 
         CachedParseOutcome {
             messages,
+            quota_samples,
             cache_entry,
         }
     }
@@ -501,6 +634,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     fn build_codex_cache_entry(
         path: &Path,
         raw_messages: Vec<UnifiedMessage>,
+        raw_quota_samples: Vec<CodexQuotaSample>,
         consumed_offset: u64,
         state: sessions::codex::CodexParseState,
         fallback_timestamp_indices: Vec<usize>,
@@ -510,10 +644,11 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             return None;
         }
 
-        Some(message_cache::CachedSourceEntry::new(
+        Some(message_cache::CachedSourceEntry::new_with_quota_samples(
             path,
             fingerprint,
             raw_messages,
+            raw_quota_samples,
             fallback_timestamp_indices,
             message_cache::build_codex_incremental_cache(path, consumed_offset, state),
         ))
@@ -537,6 +672,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
+                    quota_samples: cached_quota_samples(cached),
                     cache_entry: None,
                 };
             }
@@ -559,6 +695,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 
         CachedParseOutcome {
             messages,
+            quota_samples: Vec::new(),
             cache_entry,
         }
     }
@@ -604,10 +741,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         headless_roots: &[PathBuf],
+        cache_enabled: bool,
     ) -> CachedParseOutcome {
         let is_headless = is_headless_path(path, headless_roots);
+        if !cache_enabled {
+            return parse_full_log_source(path, pricing, is_headless, false);
+        }
         let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
-            return parse_full_log_source(path, pricing, is_headless);
+            return parse_full_log_source(path, pricing, is_headless, true);
         };
         let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
 
@@ -621,6 +762,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                         &cached.fallback_timestamp_indices,
                         fallback_timestamp,
                     ),
+                    quota_samples: cached_quota_samples(cached),
                     cache_entry: None,
                 };
             }
@@ -636,6 +778,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                     );
                     if parsed.parse_succeeded {
                         let mut raw_messages = cached.messages.clone();
+                        let mut raw_quota_samples = cached.quota_samples.clone();
                         let mut fallback_timestamp_indices =
                             cached.fallback_timestamp_indices.clone();
                         let existing_len = raw_messages.len();
@@ -646,6 +789,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                                 .map(|index| existing_len + index),
                         );
                         raw_messages.extend(parsed.messages.clone());
+                        raw_quota_samples.extend(parsed.quota_samples.clone());
                         let messages = finalize_codex_messages(
                             raw_messages.clone(),
                             pricing,
@@ -657,16 +801,18 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                         let cache_entry = build_codex_cache_entry(
                             path,
                             raw_messages,
+                            raw_quota_samples.clone(),
                             parsed.consumed_offset,
                             parsed.state,
                             fallback_timestamp_indices,
                         );
                         if cache_entry.is_none() {
-                            return parse_full_log_source(path, pricing, is_headless);
+                            return parse_full_log_source(path, pricing, is_headless, true);
                         }
 
                         return CachedParseOutcome {
                             messages,
+                            quota_samples: raw_quota_samples,
                             cache_entry,
                         };
                     }
@@ -674,7 +820,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             }
         }
 
-        parse_full_log_source(path, pricing, is_headless)
+        parse_full_log_source(path, pricing, is_headless, true)
     }
 
     let scan_result = scanner::scan_all_clients_with_scanner_settings(
@@ -684,9 +830,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         scanner_settings,
     );
     let headless_roots = scanner::headless_roots_with_env_strategy(home_dir, use_env_roots);
-    let mut source_cache = message_cache::SourceMessageCache::load();
-    source_cache.prune_missing_files();
+    let use_source_cache = date_filter.is_none();
+    let mut source_cache = if use_source_cache {
+        let mut cache = message_cache::SourceMessageCache::load();
+        cache.prune_missing_files();
+        cache
+    } else {
+        message_cache::SourceMessageCache::default()
+    };
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
+    let mut all_quota_samples: Vec<CodexQuotaSample> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
 
@@ -697,6 +850,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     for db_path in &scan_result.opencode_dbs {
         let CachedParseOutcome {
             messages,
+            quota_samples: _,
             cache_entry,
         } = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
             sessions::opencode::parse_opencode_sqlite(path)
@@ -773,12 +927,63 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .collect();
     all_messages.extend(claude_messages);
 
-    let codex_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Codex)
-        .par_iter()
-        .map(|path| load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots))
+    let codex_sources_all = scan_result.get(ClientId::Codex);
+    let codex_sources: Vec<&PathBuf> = codex_sources_all
+        .iter()
+        .filter(|path| codex_path_matches_date_filter(path, date_filter))
         .collect();
-    for outcome in codex_outcomes {
+    let codex_outcomes: Vec<CachedParseOutcome> = codex_sources
+        .par_iter()
+        .map(|path| {
+            load_or_parse_codex_source(
+                path.as_path(),
+                &source_cache,
+                pricing,
+                &headless_roots,
+                use_source_cache,
+            )
+        })
+        .collect();
+    let codex_account_ledger = if include_codex_account_ledger {
+        let mut conversation_ids = BTreeSet::new();
+        for outcome in &codex_outcomes {
+            for message in &outcome.messages {
+                if let Some(conversation_id) =
+                    sessions::codex_account::conversation_id_from_session_id(&message.session_id)
+                {
+                    conversation_ids.insert(conversation_id.to_string());
+                }
+            }
+            for sample in &outcome.quota_samples {
+                if let Some(conversation_id) =
+                    sessions::codex_account::conversation_id_from_session_id(&sample.session_id)
+                {
+                    conversation_ids.insert(conversation_id.to_string());
+                }
+            }
+        }
+        let (since_ts, until_ts) = date_filter
+            .map(DateFilter::ledger_ts_range)
+            .unwrap_or((None, None));
+        sessions::codex_account::load_codex_account_ledger_for_conversations(
+            home_dir,
+            &conversation_ids,
+            since_ts,
+            until_ts,
+        )
+    } else {
+        sessions::codex_account::CodexAccountLedger::default()
+    };
+    for mut outcome in codex_outcomes {
+        sessions::codex_account::apply_codex_account_ledger(
+            &mut outcome.messages,
+            &codex_account_ledger,
+        );
+        sessions::codex_account::apply_codex_account_ledger_to_quota_samples(
+            &mut outcome.quota_samples,
+            &codex_account_ledger,
+        );
+        all_quota_samples.extend(outcome.quota_samples);
         all_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
@@ -1089,9 +1294,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    source_cache.save_if_dirty();
+    if use_source_cache {
+        source_cache.save_if_dirty();
+    }
 
-    all_messages
+    ParsedLocalUsage {
+        messages: all_messages,
+        quota_samples: all_quota_samples,
+    }
 }
 
 fn filter_unified_messages(
@@ -1111,6 +1321,28 @@ fn filter_unified_messages(
 
     if let Some(until) = &options.until {
         filtered.retain(|m| m.date.as_str() <= until.as_str());
+    }
+
+    filtered
+}
+
+fn filter_quota_samples(
+    samples: Vec<CodexQuotaSample>,
+    options: &LocalParseOptions,
+) -> Vec<CodexQuotaSample> {
+    let mut filtered = samples;
+
+    if let Some(year) = &options.year {
+        let year_prefix = format!("{}-", year);
+        filtered.retain(|sample| sample.date.starts_with(&year_prefix));
+    }
+
+    if let Some(since) = &options.since {
+        filtered.retain(|sample| sample.date.as_str() >= since.as_str());
+    }
+
+    if let Some(until) = &options.until {
+        filtered.retain(|sample| sample.date.as_str() <= until.as_str());
     }
 
     filtered
@@ -1244,12 +1476,14 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
     });
 
     let pricing = load_pricing_for_local_parse().await;
+    let date_filter = DateFilter::from_report_options(&options);
     let all_messages = parse_all_messages_with_pricing_with_env_strategy(
         &home_dir,
         &clients,
         pricing.as_deref(),
         options.use_env_roots,
         &options.scanner_settings,
+        date_filter.as_ref(),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -1300,12 +1534,14 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
     });
 
     let pricing = load_pricing_for_local_parse().await;
+    let date_filter = DateFilter::from_report_options(&options);
     let all_messages = parse_all_messages_with_pricing_with_env_strategy(
         &home_dir,
         &clients,
         pricing.as_deref(),
         options.use_env_roots,
         &options.scanner_settings,
+        date_filter.as_ref(),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -1480,12 +1716,14 @@ async fn generate_graph_with_loaded_pricing(
         clients
     });
 
+    let date_filter = DateFilter::from_report_options(&options);
     let all_messages = parse_all_messages_with_pricing_with_env_strategy(
         &home_dir,
         &clients,
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        date_filter.as_ref(),
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
@@ -1528,6 +1766,69 @@ fn filter_messages_for_report(
     }
 
     filtered
+}
+
+fn codex_path_matches_date_filter(path: &Path, filter: Option<&DateFilter>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let Some(date) = date_from_codex_path(path) else {
+        return true;
+    };
+    filter.includes_date(&date)
+}
+
+fn date_start_timestamp(date: &str) -> Option<i64> {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)
+        .map(|datetime| datetime.and_utc().timestamp())
+}
+
+fn date_end_timestamp(date: &str) -> Option<i64> {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(23, 59, 59)
+        .map(|datetime| datetime.and_utc().timestamp())
+}
+
+fn date_from_codex_path(path: &Path) -> Option<String> {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect();
+
+    for window in parts.windows(3) {
+        let year = &window[0];
+        let month = &window[1];
+        let day = &window[2];
+        if year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.chars().all(|ch| ch.is_ascii_digit())
+            && month.chars().all(|ch| ch.is_ascii_digit())
+            && day.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Some(format!("{year}-{month}-{day}"));
+        }
+    }
+
+    let name = path.file_name()?.to_str()?;
+    let bytes = name.as_bytes();
+    for start in 0..bytes.len().saturating_sub(9) {
+        let candidate = &bytes[start..start + 10];
+        if candidate.get(4) == Some(&b'-')
+            && candidate.get(7) == Some(&b'-')
+            && candidate
+                .iter()
+                .enumerate()
+                .all(|(idx, byte)| matches!(idx, 4 | 7) || byte.is_ascii_digit())
+        {
+            return std::str::from_utf8(candidate).ok().map(ToOwned::to_owned);
+        }
+    }
+
+    None
 }
 
 fn is_headless_path(path: &Path, headless_roots: &[PathBuf]) -> bool {
@@ -1607,14 +1908,29 @@ fn parse_local_unified_messages_resolved(
     clients: &[String],
     pricing: Option<&pricing::PricingService>,
 ) -> Result<Vec<UnifiedMessage>, String> {
-    let messages = parse_all_messages_with_pricing_with_env_strategy(
+    Ok(parse_local_usage_resolved(options, home_dir, clients, pricing)?.messages)
+}
+
+fn parse_local_usage_resolved(
+    options: LocalParseOptions,
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+) -> Result<ParsedLocalUsage, String> {
+    let date_filter = DateFilter::from_local_options(&options);
+    let usage = parse_all_usage_with_pricing_with_env_strategy(
         home_dir,
         clients,
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        date_filter.as_ref(),
+        true,
     );
-    Ok(filter_unified_messages(messages, &options))
+    Ok(ParsedLocalUsage {
+        messages: filter_unified_messages(usage.messages, &options),
+        quota_samples: filter_quota_samples(usage.quota_samples, &options),
+    })
 }
 pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages, String> {
     let start = Instant::now();
@@ -2010,12 +2326,22 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 }
 
 #[doc(hidden)]
+pub async fn parse_local_usage_with_pricing(
+    options: LocalParseOptions,
+    pricing: Option<&pricing::PricingService>,
+) -> Result<ParsedLocalUsage, String> {
+    let (home_dir, clients) = resolve_local_parse_request(&options)?;
+    parse_local_usage_resolved(options, &home_dir, &clients, pricing)
+}
+
+#[doc(hidden)]
 pub async fn parse_local_unified_messages_with_pricing(
     options: LocalParseOptions,
     pricing: Option<&pricing::PricingService>,
 ) -> Result<Vec<UnifiedMessage>, String> {
-    let (home_dir, clients) = resolve_local_parse_request(&options)?;
-    parse_local_unified_messages_resolved(options, &home_dir, &clients, pricing)
+    Ok(parse_local_usage_with_pricing(options, pricing)
+        .await?
+        .messages)
 }
 
 pub async fn parse_local_unified_messages(
@@ -2095,7 +2421,9 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         cost,
         message_count: msg.message_count,
         agent: msg.agent.clone(),
+        codex_account_hash: None,
         dedup_key: None,
+        generation_duration_ms: None,
         is_turn_start: false,
     }
 }

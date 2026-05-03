@@ -1,5 +1,5 @@
 use crate::sessions::codex::CodexParseState;
-use crate::UnifiedMessage;
+use crate::{CodexQuotaSample, UnifiedMessage};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -246,6 +246,8 @@ pub(crate) struct CachedSourceEntry {
     pub path: CachedPath,
     pub fingerprint: SourceFingerprint,
     pub messages: Vec<UnifiedMessage>,
+    #[serde(default)]
+    pub quota_samples: Vec<CodexQuotaSample>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub codex_incremental: Option<CodexIncrementalCache>,
 }
@@ -262,6 +264,25 @@ impl CachedSourceEntry {
             path: CachedPath::from_path(path),
             fingerprint,
             messages,
+            quota_samples: Vec::new(),
+            fallback_timestamp_indices,
+            codex_incremental,
+        }
+    }
+
+    pub(crate) fn new_with_quota_samples(
+        path: &Path,
+        fingerprint: SourceFingerprint,
+        messages: Vec<UnifiedMessage>,
+        quota_samples: Vec<CodexQuotaSample>,
+        fallback_timestamp_indices: Vec<usize>,
+        codex_incremental: Option<CodexIncrementalCache>,
+    ) -> Self {
+        Self {
+            path: CachedPath::from_path(path),
+            fingerprint,
+            messages,
+            quota_samples,
             fallback_timestamp_indices,
             codex_incremental,
         }
@@ -878,7 +899,7 @@ mod tests {
 
         let file = write_temp_file(b"{}\n");
         let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
-        let entry = CachedSourceEntry::new(
+        let entry = CachedSourceEntry::new_with_quota_samples(
             file.path(),
             fingerprint,
             vec![UnifiedMessage::new(
@@ -896,6 +917,16 @@ mod tests {
                 },
                 0.0,
             )],
+            vec![CodexQuotaSample::new(
+                "session-1",
+                1_735_689_600_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                4.0,
+                10080,
+                1_736_294_400_000,
+            )],
             Vec::new(),
             None,
         );
@@ -906,7 +937,11 @@ mod tests {
 
         let loaded = SourceMessageCache::load();
         assert_eq!(loaded.entries.len(), 1);
-        assert!(loaded.get(file.path()).is_some());
+        let loaded_entry = loaded.get(file.path()).unwrap();
+        assert_eq!(loaded_entry.messages.len(), 1);
+        assert_eq!(loaded_entry.quota_samples.len(), 1);
+        assert_eq!(loaded_entry.quota_samples[0].window_kind, "secondary");
+        assert_eq!(loaded_entry.quota_samples[0].used_percent, 4.0);
 
         restore_cache_env(prev_env);
     }

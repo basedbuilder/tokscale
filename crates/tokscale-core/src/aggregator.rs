@@ -467,7 +467,9 @@ mod tests {
             cost,
             message_count: 1,
             agent: None,
+            codex_account_hash: None,
             dedup_key: None,
+            generation_duration_ms: None,
             is_turn_start: false,
         }
     }

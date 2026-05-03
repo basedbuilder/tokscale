@@ -15,13 +15,17 @@ use tokscale_core::{sessions, GroupBy};
 use crate::ClientFilter;
 
 use super::data::{
-    AgentUsage, ContributionDay, DailyModelInfo, DailySourceInfo, DailyUsage, GraphData,
-    HourlyModelInfo, HourlyUsage, ModelUsage, TokenBreakdown, UsageData,
+    AgentUsage, CodexAccountUsage, ContributionDay, DailyModelInfo, DailySourceInfo, DailyUsage,
+    GraphData, HourlyModelInfo, HourlyUsage, ModelUsage, PriceSummary, PriceUsage, QuotaConfidence,
+    QuotaModelSummary, QuotaValueData, QuotaValueInterval, QuotaValuePoint, SpeedSummary,
+    SpeedUsage, ThinkingSummary, ThinkingUsage, TokenBreakdown, UsageData,
 };
 
-/// Cache staleness threshold: 5 minutes (matches TS implementation)
-const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-const CACHE_SCHEMA_VERSION: u32 = 7;
+/// Cache staleness threshold for automatic background refresh.
+/// TUI startup should prefer showing cached data immediately; explicit refresh
+/// and configured auto-refresh still force a reload when the user wants it.
+const CACHE_STALE_THRESHOLD_MS: u64 = 60 * 60 * 1000;
+const CACHE_SCHEMA_VERSION: u32 = 17;
 
 /// Get the cache directory path
 /// Uses `~/.cache/tokscale/` to match TypeScript implementation for cache sharing
@@ -56,6 +60,12 @@ struct CachedTUIData {
     include_synthetic: bool,
     #[serde(default)]
     group_by: Option<String>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+    #[serde(default)]
+    year: Option<String>,
     data: CachedUsageData,
 }
 
@@ -69,6 +79,16 @@ struct CachedUsageData {
     daily: Vec<CachedDailyUsage>,
     #[serde(default)]
     hourly: Vec<CachedHourlyUsage>,
+    #[serde(default)]
+    prices: Vec<CachedPriceUsage>,
+    #[serde(default)]
+    thinking: Vec<CachedThinkingUsage>,
+    #[serde(default)]
+    speeds: Vec<CachedSpeedUsage>,
+    #[serde(default)]
+    codex_accounts: Vec<CachedCodexAccountUsage>,
+    #[serde(default)]
+    quota_value: CachedQuotaValueData,
     graph: Option<CachedGraphData>,
     total_tokens: u64,
     total_cost: f64,
@@ -177,6 +197,144 @@ struct CachedHourlyUsage {
     message_count: u32,
     #[serde(default)]
     turn_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedPriceUsage {
+    date: String,
+    model: String,
+    provider: String,
+    #[serde(default)]
+    pricing_source: Option<String>,
+    #[serde(default)]
+    matched_key: Option<String>,
+    tokens: CachedTokenBreakdown,
+    cost: f64,
+    #[serde(default)]
+    clients: Vec<String>,
+    #[serde(default)]
+    message_count: u32,
+    #[serde(default)]
+    input_price_per_million: Option<f64>,
+    #[serde(default)]
+    output_price_per_million: Option<f64>,
+    #[serde(default)]
+    cache_read_price_per_million: Option<f64>,
+    #[serde(default)]
+    cache_write_price_per_million: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedThinkingUsage {
+    date: String,
+    model: String,
+    provider: String,
+    thinking_level: String,
+    tokens: CachedTokenBreakdown,
+    cost: f64,
+    #[serde(default)]
+    clients: Vec<String>,
+    #[serde(default)]
+    message_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedSpeedUsage {
+    date: String,
+    model: String,
+    provider: String,
+    thinking_level: String,
+    generated_tokens: u64,
+    generation_duration_ms: u64,
+    #[serde(default)]
+    clients: Vec<String>,
+    sample_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedCodexAccountUsage {
+    account_hash: String,
+    tokens: CachedTokenBreakdown,
+    cost: f64,
+    #[serde(default)]
+    paid_cost: Option<f64>,
+    #[serde(default)]
+    active_month_count: Option<u32>,
+    message_count: u32,
+    turn_count: u32,
+    session_count: u32,
+    #[serde(default)]
+    first_date: Option<String>,
+    #[serde(default)]
+    latest_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedQuotaValueData {
+    #[serde(default)]
+    intervals: Vec<CachedQuotaValueInterval>,
+    #[serde(default)]
+    points: Vec<CachedQuotaValuePoint>,
+    #[serde(default)]
+    model_summaries: Vec<CachedQuotaModelSummary>,
+    #[serde(default)]
+    sample_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedQuotaValueInterval {
+    account_hash: String,
+    #[serde(default)]
+    model: String,
+    window_kind: String,
+    end: String,
+    quota_burn_pct: f64,
+    api_value_usd: f64,
+    subscription_cost_burned: f64,
+    factor: Option<f64>,
+    dollars_per_percent: Option<f64>,
+    tokens: CachedTokenBreakdown,
+    models: Vec<String>,
+    sample_count: u32,
+    confidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedQuotaValuePoint {
+    date: String,
+    #[serde(default)]
+    model: String,
+    window_kind: String,
+    quota_burn_pct: f64,
+    api_value_usd: f64,
+    subscription_cost_burned: f64,
+    factor: Option<f64>,
+    dollars_per_percent: Option<f64>,
+    interval_count: u32,
+    confidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedQuotaModelSummary {
+    model: String,
+    window_kind: String,
+    latest_date: String,
+    quota_burn_pct: f64,
+    api_value_usd: f64,
+    subscription_cost_burned: f64,
+    factor: Option<f64>,
+    dollars_per_percent: Option<f64>,
+    tokens: CachedTokenBreakdown,
+    interval_count: u32,
+    confidence: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -398,6 +556,162 @@ impl From<&HourlyUsage> for CachedHourlyUsage {
     }
 }
 
+impl From<&PriceUsage> for CachedPriceUsage {
+    fn from(p: &PriceUsage) -> Self {
+        Self {
+            date: p.date.to_string(),
+            model: p.model.clone(),
+            provider: p.provider.clone(),
+            pricing_source: p.pricing_source.clone(),
+            matched_key: p.matched_key.clone(),
+            tokens: (&p.tokens).into(),
+            cost: p.cost,
+            clients: p.clients.iter().cloned().collect(),
+            message_count: p.message_count,
+            input_price_per_million: p.input_price_per_million,
+            output_price_per_million: p.output_price_per_million,
+            cache_read_price_per_million: p.cache_read_price_per_million,
+            cache_write_price_per_million: p.cache_write_price_per_million,
+        }
+    }
+}
+
+impl TryFrom<CachedPriceUsage> for PriceUsage {
+    type Error = chrono::ParseError;
+
+    fn try_from(p: CachedPriceUsage) -> Result<Self, Self::Error> {
+        use chrono::NaiveDate;
+
+        Ok(Self {
+            date: NaiveDate::parse_from_str(&p.date, "%Y-%m-%d")?,
+            model: p.model,
+            provider: p.provider,
+            pricing_source: p.pricing_source,
+            matched_key: p.matched_key,
+            tokens: p.tokens.into(),
+            cost: p.cost,
+            clients: p.clients.into_iter().collect(),
+            message_count: p.message_count,
+            input_price_per_million: p.input_price_per_million,
+            output_price_per_million: p.output_price_per_million,
+            cache_read_price_per_million: p.cache_read_price_per_million,
+            cache_write_price_per_million: p.cache_write_price_per_million,
+        })
+    }
+}
+
+impl From<&ThinkingUsage> for CachedThinkingUsage {
+    fn from(t: &ThinkingUsage) -> Self {
+        Self {
+            date: t.date.to_string(),
+            model: t.model.clone(),
+            provider: t.provider.clone(),
+            thinking_level: t.thinking_level.clone(),
+            tokens: (&t.tokens).into(),
+            cost: t.cost,
+            clients: t.clients.iter().cloned().collect(),
+            message_count: t.message_count,
+        }
+    }
+}
+
+impl TryFrom<CachedThinkingUsage> for ThinkingUsage {
+    type Error = chrono::ParseError;
+
+    fn try_from(t: CachedThinkingUsage) -> Result<Self, Self::Error> {
+        use chrono::NaiveDate;
+
+        Ok(Self {
+            date: NaiveDate::parse_from_str(&t.date, "%Y-%m-%d")?,
+            model: t.model,
+            provider: t.provider,
+            thinking_level: t.thinking_level,
+            tokens: t.tokens.into(),
+            cost: t.cost,
+            clients: t.clients.into_iter().collect(),
+            message_count: t.message_count,
+        })
+    }
+}
+
+impl From<&SpeedUsage> for CachedSpeedUsage {
+    fn from(s: &SpeedUsage) -> Self {
+        Self {
+            date: s.date.to_string(),
+            model: s.model.clone(),
+            provider: s.provider.clone(),
+            thinking_level: s.thinking_level.clone(),
+            generated_tokens: s.generated_tokens,
+            generation_duration_ms: s.generation_duration_ms,
+            clients: s.clients.iter().cloned().collect(),
+            sample_count: s.sample_count,
+        }
+    }
+}
+
+impl TryFrom<CachedSpeedUsage> for SpeedUsage {
+    type Error = chrono::ParseError;
+
+    fn try_from(s: CachedSpeedUsage) -> Result<Self, Self::Error> {
+        use chrono::NaiveDate;
+
+        Ok(Self {
+            date: NaiveDate::parse_from_str(&s.date, "%Y-%m-%d")?,
+            model: s.model,
+            provider: s.provider,
+            thinking_level: s.thinking_level,
+            generated_tokens: s.generated_tokens,
+            generation_duration_ms: s.generation_duration_ms,
+            clients: s.clients.into_iter().collect(),
+            sample_count: s.sample_count,
+        })
+    }
+}
+
+impl From<&CodexAccountUsage> for CachedCodexAccountUsage {
+    fn from(a: &CodexAccountUsage) -> Self {
+        Self {
+            account_hash: a.account_hash.clone(),
+            tokens: (&a.tokens).into(),
+            cost: a.cost,
+            paid_cost: a.paid_cost,
+            active_month_count: a.active_month_count,
+            message_count: a.message_count,
+            turn_count: a.turn_count,
+            session_count: a.session_count,
+            first_date: a.first_date.map(|date| date.to_string()),
+            latest_date: a.latest_date.map(|date| date.to_string()),
+        }
+    }
+}
+
+impl TryFrom<CachedCodexAccountUsage> for CodexAccountUsage {
+    type Error = chrono::ParseError;
+
+    fn try_from(a: CachedCodexAccountUsage) -> Result<Self, Self::Error> {
+        use chrono::NaiveDate;
+
+        Ok(Self {
+            account_hash: a.account_hash,
+            tokens: a.tokens.into(),
+            cost: a.cost,
+            paid_cost: a.paid_cost,
+            active_month_count: a.active_month_count,
+            message_count: a.message_count,
+            turn_count: a.turn_count,
+            session_count: a.session_count,
+            first_date: a
+                .first_date
+                .map(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d"))
+                .transpose()?,
+            latest_date: a
+                .latest_date
+                .map(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d"))
+                .transpose()?,
+        })
+    }
+}
+
 impl TryFrom<CachedHourlyUsage> for HourlyUsage {
     type Error = chrono::ParseError;
 
@@ -419,6 +733,177 @@ impl TryFrom<CachedHourlyUsage> for HourlyUsage {
             message_count: h.message_count,
             turn_count: h.turn_count,
         })
+    }
+}
+
+impl From<&QuotaValueData> for CachedQuotaValueData {
+    fn from(data: &QuotaValueData) -> Self {
+        Self {
+            intervals: data
+                .intervals
+                .iter()
+                .map(|interval| interval.into())
+                .collect(),
+            points: data.points.iter().map(|point| point.into()).collect(),
+            model_summaries: data
+                .model_summaries
+                .iter()
+                .map(|summary| summary.into())
+                .collect(),
+            sample_count: data.sample_count,
+        }
+    }
+}
+
+impl TryFrom<CachedQuotaValueData> for QuotaValueData {
+    type Error = chrono::ParseError;
+
+    fn try_from(data: CachedQuotaValueData) -> Result<Self, Self::Error> {
+        let intervals: Result<Vec<QuotaValueInterval>, _> = data
+            .intervals
+            .into_iter()
+            .map(|row| row.try_into())
+            .collect();
+        let points: Result<Vec<QuotaValuePoint>, _> = data
+            .points
+            .into_iter()
+            .map(|point| point.try_into())
+            .collect();
+        let model_summaries: Result<Vec<QuotaModelSummary>, _> = data
+            .model_summaries
+            .into_iter()
+            .map(|summary| summary.try_into())
+            .collect();
+        Ok(Self {
+            intervals: intervals?,
+            points: points?,
+            model_summaries: model_summaries?,
+            sample_count: data.sample_count,
+        })
+    }
+}
+
+impl From<&QuotaValueInterval> for CachedQuotaValueInterval {
+    fn from(interval: &QuotaValueInterval) -> Self {
+        Self {
+            account_hash: interval.account_hash.clone(),
+            model: interval.model.clone(),
+            window_kind: interval.window_kind.clone(),
+            end: interval.end.to_string(),
+            quota_burn_pct: interval.quota_burn_pct,
+            api_value_usd: interval.api_value_usd,
+            subscription_cost_burned: interval.subscription_cost_burned,
+            factor: interval.factor,
+            dollars_per_percent: interval.dollars_per_percent,
+            tokens: (&interval.tokens).into(),
+            models: interval.models.iter().cloned().collect(),
+            sample_count: interval.sample_count,
+            confidence: interval.confidence.as_str().to_string(),
+        }
+    }
+}
+
+impl TryFrom<CachedQuotaValueInterval> for QuotaValueInterval {
+    type Error = chrono::ParseError;
+
+    fn try_from(interval: CachedQuotaValueInterval) -> Result<Self, Self::Error> {
+        Ok(Self {
+            account_hash: interval.account_hash,
+            model: interval.model,
+            window_kind: interval.window_kind,
+            end: chrono::NaiveDateTime::parse_from_str(&interval.end, "%Y-%m-%d %H:%M:%S")?,
+            quota_burn_pct: interval.quota_burn_pct,
+            api_value_usd: interval.api_value_usd,
+            subscription_cost_burned: interval.subscription_cost_burned,
+            factor: interval.factor,
+            dollars_per_percent: interval.dollars_per_percent,
+            tokens: interval.tokens.into(),
+            models: interval.models.into_iter().collect(),
+            sample_count: interval.sample_count,
+            confidence: parse_quota_confidence(&interval.confidence),
+        })
+    }
+}
+
+impl From<&QuotaValuePoint> for CachedQuotaValuePoint {
+    fn from(point: &QuotaValuePoint) -> Self {
+        Self {
+            date: point.date.to_string(),
+            model: point.model.clone(),
+            window_kind: point.window_kind.clone(),
+            quota_burn_pct: point.quota_burn_pct,
+            api_value_usd: point.api_value_usd,
+            subscription_cost_burned: point.subscription_cost_burned,
+            factor: point.factor,
+            dollars_per_percent: point.dollars_per_percent,
+            interval_count: point.interval_count,
+            confidence: point.confidence.as_str().to_string(),
+        }
+    }
+}
+
+impl TryFrom<CachedQuotaValuePoint> for QuotaValuePoint {
+    type Error = chrono::ParseError;
+
+    fn try_from(point: CachedQuotaValuePoint) -> Result<Self, Self::Error> {
+        Ok(Self {
+            date: chrono::NaiveDate::parse_from_str(&point.date, "%Y-%m-%d")?,
+            model: point.model,
+            window_kind: point.window_kind,
+            quota_burn_pct: point.quota_burn_pct,
+            api_value_usd: point.api_value_usd,
+            subscription_cost_burned: point.subscription_cost_burned,
+            factor: point.factor,
+            dollars_per_percent: point.dollars_per_percent,
+            interval_count: point.interval_count,
+            confidence: parse_quota_confidence(&point.confidence),
+        })
+    }
+}
+
+impl From<&QuotaModelSummary> for CachedQuotaModelSummary {
+    fn from(summary: &QuotaModelSummary) -> Self {
+        Self {
+            model: summary.model.clone(),
+            window_kind: summary.window_kind.clone(),
+            latest_date: summary.latest_date.to_string(),
+            quota_burn_pct: summary.quota_burn_pct,
+            api_value_usd: summary.api_value_usd,
+            subscription_cost_burned: summary.subscription_cost_burned,
+            factor: summary.factor,
+            dollars_per_percent: summary.dollars_per_percent,
+            tokens: (&summary.tokens).into(),
+            interval_count: summary.interval_count,
+            confidence: summary.confidence.as_str().to_string(),
+        }
+    }
+}
+
+impl TryFrom<CachedQuotaModelSummary> for QuotaModelSummary {
+    type Error = chrono::ParseError;
+
+    fn try_from(summary: CachedQuotaModelSummary) -> Result<Self, Self::Error> {
+        Ok(Self {
+            model: summary.model,
+            window_kind: summary.window_kind,
+            latest_date: chrono::NaiveDate::parse_from_str(&summary.latest_date, "%Y-%m-%d")?,
+            quota_burn_pct: summary.quota_burn_pct,
+            api_value_usd: summary.api_value_usd,
+            subscription_cost_burned: summary.subscription_cost_burned,
+            factor: summary.factor,
+            dollars_per_percent: summary.dollars_per_percent,
+            tokens: summary.tokens.into(),
+            interval_count: summary.interval_count,
+            confidence: parse_quota_confidence(&summary.confidence),
+        })
+    }
+}
+
+fn parse_quota_confidence(value: &str) -> QuotaConfidence {
+    match value {
+        "High" => QuotaConfidence::High,
+        "Medium" => QuotaConfidence::Medium,
+        _ => QuotaConfidence::Low,
     }
 }
 
@@ -566,6 +1051,11 @@ impl From<&UsageData> for CachedUsageData {
             agents: u.agents.iter().map(|a| a.into()).collect(),
             daily: u.daily.iter().map(|d| d.into()).collect(),
             hourly: u.hourly.iter().map(|h| h.into()).collect(),
+            prices: u.prices_daily.iter().map(|p| p.into()).collect(),
+            thinking: u.thinking_daily.iter().map(|t| t.into()).collect(),
+            speeds: u.speeds_daily.iter().map(|s| s.into()).collect(),
+            codex_accounts: u.codex_accounts.iter().map(|a| a.into()).collect(),
+            quota_value: (&u.quota_value).into(),
             graph: u.graph.as_ref().map(|g| g.into()),
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
@@ -582,13 +1072,32 @@ impl TryFrom<CachedUsageData> for UsageData {
         let daily: Result<Vec<DailyUsage>, _> = u.daily.into_iter().map(|d| d.try_into()).collect();
         let hourly: Result<Vec<HourlyUsage>, _> =
             u.hourly.into_iter().map(|h| h.try_into()).collect();
+        let prices_daily: Result<Vec<PriceUsage>, _> =
+            u.prices.into_iter().map(|p| p.try_into()).collect();
+        let thinking_daily: Result<Vec<ThinkingUsage>, _> =
+            u.thinking.into_iter().map(|t| t.try_into()).collect();
+        let speeds_daily: Result<Vec<SpeedUsage>, _> =
+            u.speeds.into_iter().map(|s| s.try_into()).collect();
+        let codex_accounts: Result<Vec<CodexAccountUsage>, _> =
+            u.codex_accounts.into_iter().map(|a| a.try_into()).collect();
         let graph: Option<Result<GraphData, _>> = u.graph.map(|g| g.try_into());
+        let prices = build_cached_price_summaries(&prices_daily.clone()?);
+        let thinking = build_cached_thinking_summaries(&thinking_daily.clone()?);
+        let speeds = build_cached_speed_summaries(&speeds_daily.clone()?);
 
         Ok(Self {
             models: u.models.into_iter().map(|m| m.into()).collect(),
             agents: normalize_cached_agents(u.agents),
             daily: daily?,
             hourly: hourly?,
+            prices,
+            prices_daily: prices_daily?,
+            thinking,
+            thinking_daily: thinking_daily?,
+            speeds,
+            speeds_daily: speeds_daily?,
+            codex_accounts: codex_accounts?,
+            quota_value: u.quota_value.try_into()?,
             graph: graph.transpose()?,
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
@@ -652,6 +1161,198 @@ fn normalize_cached_agent_name(agent: &str, clients: &str) -> String {
     }
 }
 
+fn build_cached_price_summaries(prices_daily: &[PriceUsage]) -> Vec<PriceSummary> {
+    let mut summary_map: BTreeMap<String, PriceSummary> = BTreeMap::new();
+
+    for row in prices_daily {
+        let entry = summary_map
+            .entry(row.model.clone())
+            .or_insert_with(|| PriceSummary {
+                model: row.model.clone(),
+                provider: row.provider.clone(),
+                pricing_source: row.pricing_source.clone(),
+                matched_key: row.matched_key.clone(),
+                latest_date: row.date,
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                clients: Default::default(),
+                message_count: 0,
+                input_price_per_million: row.input_price_per_million,
+                output_price_per_million: row.output_price_per_million,
+                cache_read_price_per_million: row.cache_read_price_per_million,
+                cache_write_price_per_million: row.cache_write_price_per_million,
+            });
+
+        if row.date > entry.latest_date {
+            entry.latest_date = row.date;
+            entry.input_price_per_million = row.input_price_per_million;
+            entry.output_price_per_million = row.output_price_per_million;
+            entry.cache_read_price_per_million = row.cache_read_price_per_million;
+            entry.cache_write_price_per_million = row.cache_write_price_per_million;
+        }
+
+        if !entry
+            .provider
+            .split(", ")
+            .any(|provider| provider == row.provider)
+        {
+            entry.provider = format!("{}, {}", entry.provider, row.provider);
+        }
+        match (
+            entry.pricing_source.as_deref(),
+            row.pricing_source.as_deref(),
+        ) {
+            (None, Some(source)) => entry.pricing_source = Some(source.to_string()),
+            (Some(existing), Some(source)) if existing != source && existing != "Mixed" => {
+                entry.pricing_source = Some("Mixed".to_string())
+            }
+            _ => {}
+        }
+
+        entry.tokens.input = entry.tokens.input.saturating_add(row.tokens.input);
+        entry.tokens.output = entry.tokens.output.saturating_add(row.tokens.output);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(row.tokens.cache_read);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(row.tokens.cache_write);
+        entry.tokens.reasoning = entry.tokens.reasoning.saturating_add(row.tokens.reasoning);
+        entry.cost += row.cost;
+        entry.clients.extend(row.clients.iter().cloned());
+        entry.message_count = entry.message_count.saturating_add(row.message_count);
+    }
+
+    summary_map.into_values().collect()
+}
+
+fn build_cached_thinking_summaries(thinking_daily: &[ThinkingUsage]) -> Vec<ThinkingSummary> {
+    let mut summary_map: BTreeMap<String, ThinkingSummary> = BTreeMap::new();
+    let mut latest_dates: BTreeMap<String, chrono::NaiveDate> = BTreeMap::new();
+
+    for row in thinking_daily {
+        let entry = summary_map
+            .entry(row.model.clone())
+            .or_insert_with(|| ThinkingSummary {
+                model: row.model.clone(),
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                clients: Default::default(),
+                message_count: 0,
+                thirty_day_trend_pct: None,
+            });
+        entry.tokens.input = entry.tokens.input.saturating_add(row.tokens.input);
+        entry.tokens.output = entry.tokens.output.saturating_add(row.tokens.output);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(row.tokens.cache_read);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(row.tokens.cache_write);
+        entry.tokens.reasoning = entry.tokens.reasoning.saturating_add(row.tokens.reasoning);
+        entry.cost += row.cost;
+        entry.clients.extend(row.clients.iter().cloned());
+        entry.message_count = entry.message_count.saturating_add(row.message_count);
+
+        latest_dates
+            .entry(row.model.clone())
+            .and_modify(|date| {
+                if row.date > *date {
+                    *date = row.date;
+                }
+            })
+            .or_insert(row.date);
+    }
+
+    for summary in summary_map.values_mut() {
+        let Some(latest_date) = latest_dates.get(&summary.model).copied() else {
+            continue;
+        };
+        let recent_start = latest_date - chrono::Duration::days(29);
+        let previous_start = recent_start - chrono::Duration::days(30);
+        let mut recent_output = 0_u64;
+        let mut recent_reasoning = 0_u64;
+        let mut previous_output = 0_u64;
+        let mut previous_reasoning = 0_u64;
+
+        for row in thinking_daily
+            .iter()
+            .filter(|row| row.model == summary.model)
+        {
+            if row.date >= recent_start && row.date <= latest_date {
+                recent_output = recent_output.saturating_add(row.tokens.output);
+                recent_reasoning = recent_reasoning.saturating_add(row.tokens.reasoning);
+            } else if row.date >= previous_start && row.date < recent_start {
+                previous_output = previous_output.saturating_add(row.tokens.output);
+                previous_reasoning = previous_reasoning.saturating_add(row.tokens.reasoning);
+            }
+        }
+
+        let recent_generated = recent_output.saturating_add(recent_reasoning);
+        let previous_generated = previous_output.saturating_add(previous_reasoning);
+        summary.thirty_day_trend_pct = if recent_generated == 0 && previous_generated == 0 {
+            Some(0.0)
+        } else if previous_generated == 0 || previous_reasoning == 0 {
+            None
+        } else {
+            let recent_rate = recent_reasoning as f64 / recent_generated as f64;
+            let previous_rate = previous_reasoning as f64 / previous_generated as f64;
+            if previous_rate <= f64::EPSILON {
+                None
+            } else {
+                Some(((recent_rate - previous_rate) / previous_rate) * 100.0)
+            }
+        };
+    }
+
+    summary_map.into_values().collect()
+}
+
+fn build_cached_speed_summaries(speeds_daily: &[SpeedUsage]) -> Vec<SpeedSummary> {
+    let mut summary_map: BTreeMap<(String, String, String), SpeedSummary> = BTreeMap::new();
+
+    for row in speeds_daily {
+        let key = (
+            row.provider.clone(),
+            row.model.clone(),
+            row.thinking_level.clone(),
+        );
+        let entry = summary_map.entry(key).or_insert_with(|| SpeedSummary {
+            model: row.model.clone(),
+            provider: row.provider.clone(),
+            thinking_level: row.thinking_level.clone(),
+            latest_date: row.date,
+            generated_tokens: 0,
+            generation_duration_ms: 0,
+            clients: Default::default(),
+            sample_count: 0,
+        });
+        if row.date > entry.latest_date {
+            entry.latest_date = row.date;
+        }
+        entry.generated_tokens = entry.generated_tokens.saturating_add(row.generated_tokens);
+        entry.generation_duration_ms = entry
+            .generation_duration_ms
+            .saturating_add(row.generation_duration_ms);
+        entry.clients.extend(row.clients.iter().cloned());
+        entry.sample_count = entry.sample_count.saturating_add(row.sample_count);
+    }
+
+    let mut summaries: Vec<SpeedSummary> = summary_map.into_values().collect();
+    summaries.sort_by(|a, b| {
+        b.tokens_per_second()
+            .total_cmp(&a.tokens_per_second())
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.thinking_level.cmp(&b.thinking_level))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    summaries
+}
+
 /// Result of loading the TUI cache — combines staleness check with data loading
 /// to avoid double file I/O (previously is_cache_stale + load_cached_data both parsed the file).
 pub enum CacheResult {
@@ -683,7 +1384,18 @@ enum ClientMatch {
 /// `(enabled_clients: Vec<String>, include_synthetic: bool)` shape so
 /// existing user caches keep working across upgrades — projection
 /// happens here.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_cache(enabled_clients: &HashSet<ClientFilter>, group_by: &GroupBy) -> CacheResult {
+    load_cache_with_filters(enabled_clients, group_by, None, None, None)
+}
+
+pub fn load_cache_with_filters(
+    enabled_clients: &HashSet<ClientFilter>,
+    group_by: &GroupBy,
+    since: Option<&str>,
+    until: Option<&str>,
+    year: Option<&str>,
+) -> CacheResult {
     let Some(cache_path) = cache_file() else {
         return CacheResult::Miss;
     };
@@ -717,6 +1429,12 @@ pub fn load_cache(enabled_clients: &HashSet<ClientFilter>, group_by: &GroupBy) -
     }
 
     if cached_group_by.as_ref() != Some(group_by) {
+        return CacheResult::Miss;
+    }
+    if cached.since.as_deref() != since
+        || cached.until.as_deref() != until
+        || cached.year.as_deref() != year
+    {
         return CacheResult::Miss;
     }
 
@@ -812,6 +1530,17 @@ pub fn save_cached_data(
     enabled_clients: &HashSet<ClientFilter>,
     group_by: &GroupBy,
 ) {
+    save_cached_data_with_filters(data, enabled_clients, group_by, None, None, None)
+}
+
+pub fn save_cached_data_with_filters(
+    data: &UsageData,
+    enabled_clients: &HashSet<ClientFilter>,
+    group_by: &GroupBy,
+    since: Option<&str>,
+    until: Option<&str>,
+    year: Option<&str>,
+) {
     let Some(cache_path) = cache_file() else {
         return;
     };
@@ -846,6 +1575,9 @@ pub fn save_cached_data(
         enabled_clients: clients_vec,
         include_synthetic,
         group_by: Some(group_by.to_string()),
+        since: since.map(ToOwned::to_owned),
+        until: until.map(ToOwned::to_owned),
+        year: year.map(ToOwned::to_owned),
         data: data.into(),
     };
 
@@ -1224,7 +1956,7 @@ mod tests {
         fs::write(
             &cache_path,
             r#"{
-  "schemaVersion": 7,
+  "schemaVersion": 17,
   "timestamp": 9999999999999,
   "enabledClients": ["claude", "cursor"],
   "includeSynthetic": false,
@@ -1327,6 +2059,145 @@ mod tests {
 
         match previous_home {
             Some(home) => unsafe { env::set_var("HOME", home) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_cache_round_trips_quota_value_from_current_schema() {
+        let temp_dir = TempDir::new().unwrap();
+        let previous_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", temp_dir.path());
+        }
+
+        let mut models = std::collections::BTreeSet::new();
+        models.insert("gpt-5.4".to_string());
+        let mut data = UsageData::default();
+        data.quota_value = QuotaValueData {
+            sample_count: 2,
+            intervals: vec![QuotaValueInterval {
+                account_hash: "acct_hash".to_string(),
+                model: "gpt-5.4".to_string(),
+                window_kind: "secondary".to_string(),
+                end: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(1, 0, 0)
+                    .unwrap(),
+                quota_burn_pct: 4.0,
+                api_value_usd: 8.0,
+                subscription_cost_burned: 1.0,
+                factor: Some(8.0),
+                dollars_per_percent: Some(2.0),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 20,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 5,
+                },
+                models,
+                sample_count: 2,
+                confidence: QuotaConfidence::Medium,
+            }],
+            points: vec![QuotaValuePoint {
+                date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                model: "gpt-5.4".to_string(),
+                window_kind: "secondary".to_string(),
+                quota_burn_pct: 4.0,
+                api_value_usd: 8.0,
+                subscription_cost_burned: 1.0,
+                factor: Some(8.0),
+                dollars_per_percent: Some(2.0),
+                interval_count: 1,
+                confidence: QuotaConfidence::Medium,
+            }],
+            model_summaries: vec![QuotaModelSummary {
+                model: "gpt-5.4".to_string(),
+                window_kind: "secondary".to_string(),
+                latest_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                quota_burn_pct: 4.0,
+                api_value_usd: 8.0,
+                subscription_cost_burned: 1.0,
+                factor: Some(8.0),
+                dollars_per_percent: Some(2.0),
+                tokens: TokenBreakdown {
+                    input: 10,
+                    output: 20,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 5,
+                },
+                interval_count: 1,
+                confidence: QuotaConfidence::Medium,
+            }],
+        };
+
+        let clients = make_filters(&[ClientFilter::Codex], false);
+        save_cached_data(&data, &clients, &GroupBy::Model);
+
+        match load_cache(&clients, &GroupBy::Model) {
+            CacheResult::Fresh(loaded) => {
+                assert_eq!(loaded.quota_value.sample_count, 2);
+                assert_eq!(loaded.quota_value.intervals.len(), 1);
+                assert_eq!(loaded.quota_value.intervals[0].account_hash, "acct_hash");
+                assert_eq!(loaded.quota_value.intervals[0].model, "gpt-5.4");
+                assert_eq!(
+                    loaded.quota_value.intervals[0].confidence,
+                    QuotaConfidence::Medium
+                );
+                assert_eq!(loaded.quota_value.points.len(), 1);
+                assert_eq!(loaded.quota_value.model_summaries.len(), 1);
+                assert_eq!(loaded.quota_value.model_summaries[0].model, "gpt-5.4");
+            }
+            other => panic!(
+                "expected fresh cache with quota value data, got {:?}",
+                other_variant_name(&other)
+            ),
+        }
+
+        match previous_home {
+            Some(home) => unsafe {
+                env::set_var("HOME", home);
+            },
+            None => unsafe {
+                env::remove_var("HOME");
+            },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cache_key_includes_date_filters() {
+        let temp_dir = TempDir::new().unwrap();
+        let previous_home = env::var_os("HOME");
+        unsafe {
+            env::set_var("HOME", temp_dir.path());
+        }
+
+        let clients = make_filters(&[ClientFilter::Codex], false);
+        let data = UsageData::default();
+        save_cached_data_with_filters(
+            &data,
+            &clients,
+            &GroupBy::Model,
+            Some("2026-04-24"),
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            load_cache_with_filters(&clients, &GroupBy::Model, Some("2026-04-24"), None, None,),
+            CacheResult::Fresh(_)
+        ));
+        assert!(matches!(
+            load_cache_with_filters(&clients, &GroupBy::Model, Some("2026-04-25"), None, None,),
+            CacheResult::Miss
+        ));
+
+        match previous_home {
+            Some(value) => unsafe { env::set_var("HOME", value) },
             None => unsafe { env::remove_var("HOME") },
         }
     }
@@ -1506,7 +2377,7 @@ mod tests {
         fs::write(
             &legacy_path,
             r#"{
-  "schemaVersion": 7,
+  "schemaVersion": 17,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,

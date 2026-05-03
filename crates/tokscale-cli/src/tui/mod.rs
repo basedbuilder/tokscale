@@ -11,7 +11,9 @@ mod themes;
 mod ui;
 
 pub use app::{App, Tab, TuiConfig};
-pub use cache::{load_cache, save_cached_data, CacheResult};
+pub use cache::{
+    load_cache_with_filters, save_cached_data, save_cached_data_with_filters, CacheResult,
+};
 pub use data::{DataLoader, UsageData};
 pub use event::{Event, EventHandler};
 
@@ -41,15 +43,6 @@ use ratatui::prelude::*;
 use tokscale_core::ClientId;
 
 use crate::ClientFilter;
-
-fn decide_initial_data(load_result: CacheResult) -> (Option<UsageData>, bool) {
-    let cached_data = match load_result {
-        CacheResult::Fresh(data) | CacheResult::Stale(data) => Some(data),
-        CacheResult::Miss => None,
-    };
-
-    (cached_data, true)
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -95,8 +88,17 @@ pub fn run(
 
     // Single file read: load cache and check freshness in one pass.
     let initial_group_by = tokscale_core::GroupBy::Model;
-    let (cached_data, needs_background_load) =
-        decide_initial_data(load_cache(&enabled_clients, &initial_group_by));
+    let (cached_data, needs_background_load) = match load_cache_with_filters(
+        &enabled_clients,
+        &initial_group_by,
+        since.as_deref(),
+        until.as_deref(),
+        year.as_deref(),
+    ) {
+        CacheResult::Fresh(data) => (Some(data), false),
+        CacheResult::Stale(data) => (Some(data), true),
+        CacheResult::Miss => (None, true),
+    };
 
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -155,11 +157,19 @@ pub fn run(
         let bg_group_by = app.group_by.borrow().clone();
 
         thread::spawn(move || {
-            let loader = DataLoader::with_filters(None, bg_since, bg_until, bg_year);
+            let loader =
+                DataLoader::with_filters(None, bg_since.clone(), bg_until.clone(), bg_year.clone());
             let result = loader.load(&bg_clients, &bg_group_by, bg_include_synthetic);
 
             if let Ok(ref data) = result {
-                save_cached_data(data, &bg_enabled_clients, &bg_group_by);
+                save_cached_data_with_filters(
+                    data,
+                    &bg_enabled_clients,
+                    &bg_group_by,
+                    bg_since.as_deref(),
+                    bg_until.as_deref(),
+                    bg_year.as_deref(),
+                );
             }
 
             let _ = tx.send(result);
@@ -188,6 +198,16 @@ pub fn run(
     restore_terminal(&mut terminal);
 
     result
+}
+
+#[cfg(test)]
+fn decide_initial_data(load_result: CacheResult) -> (Option<UsageData>, bool) {
+    let cached_data = match load_result {
+        CacheResult::Fresh(data) | CacheResult::Stale(data) => Some(data),
+        CacheResult::Miss => None,
+    };
+
+    (cached_data, true)
 }
 
 #[cfg(test)]
@@ -294,10 +314,18 @@ fn run_loop_with_background(
             let group_by = app.group_by.borrow().clone();
 
             thread::spawn(move || {
-                let loader = DataLoader::with_filters(None, since, until, year);
+                let loader =
+                    DataLoader::with_filters(None, since.clone(), until.clone(), year.clone());
                 let result = loader.load(&clients, &group_by, include_synthetic);
                 if let Ok(ref data) = result {
-                    save_cached_data(data, &enabled_clients, &group_by);
+                    save_cached_data_with_filters(
+                        data,
+                        &enabled_clients,
+                        &group_by,
+                        since.as_deref(),
+                        until.as_deref(),
+                        year.as_deref(),
+                    );
                 }
                 let _ = tx.send(result);
             });

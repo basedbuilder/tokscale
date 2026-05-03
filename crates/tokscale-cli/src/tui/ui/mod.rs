@@ -1,3 +1,4 @@
+mod accounts;
 mod agents;
 mod bar_chart;
 mod daily;
@@ -8,8 +9,12 @@ mod hourly;
 mod hourly_profile;
 mod models;
 mod overview;
+mod prices;
+mod quota;
+mod speeds;
 pub mod spinner;
 mod stats;
+mod thinking;
 pub(crate) mod widgets;
 
 use ratatui::prelude::*;
@@ -48,6 +53,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Tab::Agents => agents::render(frame, app, chunks[1]),
             Tab::Daily => daily::render(frame, app, chunks[1]),
             Tab::Hourly => hourly::render(frame, app, chunks[1]),
+            Tab::Prices => prices::render(frame, app, chunks[1]),
+            Tab::Thinking => thinking::render(frame, app, chunks[1]),
+            Tab::Speeds => speeds::render(frame, app, chunks[1]),
+            Tab::Accounts => accounts::render(frame, app, chunks[1]),
+            Tab::Quota => quota::render(frame, app, chunks[1]),
             Tab::Stats => stats::render(frame, app, chunks[1]),
         }
     }

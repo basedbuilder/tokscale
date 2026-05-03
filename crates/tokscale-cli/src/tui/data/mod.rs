@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
 use tokio::runtime::{Handle, Runtime};
 
-use tokscale_core::sessions::UnifiedMessage;
+use tokscale_core::pricing::PricingService;
+use tokscale_core::sessions::{CodexQuotaSample, UnifiedMessage};
 use tokscale_core::{
-    normalize_model_for_grouping, parse_local_unified_messages, sessions, ClientId, GroupBy,
+    normalize_model_for_grouping, parse_local_usage_with_pricing, sessions, ClientId, GroupBy,
     LocalParseOptions,
 };
 
@@ -25,6 +27,9 @@ fn data_loader_scanner_settings() -> tokscale_core::scanner::ScannerSettings {
 fn data_loader_scanner_settings() -> tokscale_core::scanner::ScannerSettings {
     tokscale_core::scanner::ScannerSettings::default()
 }
+
+const MIN_REASONABLE_TOKENS_PER_SECOND: f64 = 30.0;
+const MAX_REASONABLE_TOKENS_PER_SECOND: f64 = 1000.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenBreakdown {
@@ -121,6 +126,200 @@ pub struct HourlyUsage {
 }
 
 #[derive(Debug, Clone)]
+pub struct PriceUsage {
+    pub date: NaiveDate,
+    pub model: String,
+    pub provider: String,
+    pub pricing_source: Option<String>,
+    pub matched_key: Option<String>,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub clients: BTreeSet<String>,
+    pub message_count: u32,
+    pub input_price_per_million: Option<f64>,
+    pub output_price_per_million: Option<f64>,
+    pub cache_read_price_per_million: Option<f64>,
+    pub cache_write_price_per_million: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PriceSummary {
+    pub model: String,
+    pub provider: String,
+    pub pricing_source: Option<String>,
+    pub matched_key: Option<String>,
+    pub latest_date: NaiveDate,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub clients: BTreeSet<String>,
+    pub message_count: u32,
+    pub input_price_per_million: Option<f64>,
+    pub output_price_per_million: Option<f64>,
+    pub cache_read_price_per_million: Option<f64>,
+    pub cache_write_price_per_million: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinkingUsage {
+    pub date: NaiveDate,
+    pub model: String,
+    pub provider: String,
+    pub thinking_level: String,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub clients: BTreeSet<String>,
+    pub message_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinkingSummary {
+    pub model: String,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub clients: BTreeSet<String>,
+    pub message_count: u32,
+    pub thirty_day_trend_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeedUsage {
+    pub date: NaiveDate,
+    pub model: String,
+    pub provider: String,
+    pub thinking_level: String,
+    pub generated_tokens: u64,
+    pub generation_duration_ms: u64,
+    pub clients: BTreeSet<String>,
+    pub sample_count: u32,
+}
+
+impl SpeedUsage {
+    pub fn tokens_per_second(&self) -> f64 {
+        if self.generation_duration_ms == 0 {
+            return 0.0;
+        }
+        self.generated_tokens as f64 / (self.generation_duration_ms as f64 / 1000.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpeedSummary {
+    pub model: String,
+    pub provider: String,
+    pub thinking_level: String,
+    pub latest_date: NaiveDate,
+    pub generated_tokens: u64,
+    pub generation_duration_ms: u64,
+    pub clients: BTreeSet<String>,
+    pub sample_count: u32,
+}
+
+impl SpeedSummary {
+    pub fn tokens_per_second(&self) -> f64 {
+        if self.generation_duration_ms == 0 {
+            return 0.0;
+        }
+        self.generated_tokens as f64 / (self.generation_duration_ms as f64 / 1000.0)
+    }
+}
+
+fn has_reasonable_tokens_per_second(generated_tokens: u64, duration_ms: u64) -> bool {
+    if generated_tokens == 0 || duration_ms == 0 {
+        return false;
+    }
+
+    let tokens_per_second = generated_tokens as f64 / (duration_ms as f64 / 1000.0);
+    (MIN_REASONABLE_TOKENS_PER_SECOND..=MAX_REASONABLE_TOKENS_PER_SECOND)
+        .contains(&tokens_per_second)
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexAccountUsage {
+    pub account_hash: String,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub paid_cost: Option<f64>,
+    pub active_month_count: Option<u32>,
+    pub message_count: u32,
+    pub turn_count: u32,
+    pub session_count: u32,
+    pub first_date: Option<NaiveDate>,
+    pub latest_date: Option<NaiveDate>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QuotaValueData {
+    pub intervals: Vec<QuotaValueInterval>,
+    pub points: Vec<QuotaValuePoint>,
+    pub model_summaries: Vec<QuotaModelSummary>,
+    pub sample_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotaValueInterval {
+    pub account_hash: String,
+    pub model: String,
+    pub window_kind: String,
+    pub end: NaiveDateTime,
+    pub quota_burn_pct: f64,
+    pub api_value_usd: f64,
+    pub subscription_cost_burned: f64,
+    pub factor: Option<f64>,
+    pub dollars_per_percent: Option<f64>,
+    pub tokens: TokenBreakdown,
+    pub models: BTreeSet<String>,
+    pub sample_count: u32,
+    pub confidence: QuotaConfidence,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotaValuePoint {
+    pub date: NaiveDate,
+    pub model: String,
+    pub window_kind: String,
+    pub quota_burn_pct: f64,
+    pub api_value_usd: f64,
+    pub subscription_cost_burned: f64,
+    pub factor: Option<f64>,
+    pub dollars_per_percent: Option<f64>,
+    pub interval_count: u32,
+    pub confidence: QuotaConfidence,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotaModelSummary {
+    pub model: String,
+    pub window_kind: String,
+    pub latest_date: NaiveDate,
+    pub quota_burn_pct: f64,
+    pub api_value_usd: f64,
+    pub subscription_cost_burned: f64,
+    pub factor: Option<f64>,
+    pub dollars_per_percent: Option<f64>,
+    pub tokens: TokenBreakdown,
+    pub interval_count: u32,
+    pub confidence: QuotaConfidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuotaConfidence {
+    High,
+    Medium,
+    #[default]
+    Low,
+}
+
+impl QuotaConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaConfidence::High => "High",
+            QuotaConfidence::Medium => "Medium",
+            QuotaConfidence::Low => "Low",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ContributionDay {
     pub date: NaiveDate,
     pub tokens: u64,
@@ -139,6 +338,14 @@ pub struct UsageData {
     pub agents: Vec<AgentUsage>,
     pub daily: Vec<DailyUsage>,
     pub hourly: Vec<HourlyUsage>,
+    pub prices: Vec<PriceSummary>,
+    pub prices_daily: Vec<PriceUsage>,
+    pub thinking: Vec<ThinkingSummary>,
+    pub thinking_daily: Vec<ThinkingUsage>,
+    pub speeds: Vec<SpeedSummary>,
+    pub speeds_daily: Vec<SpeedUsage>,
+    pub codex_accounts: Vec<CodexAccountUsage>,
+    pub quota_value: QuotaValueData,
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
     pub total_cost: f64,
@@ -157,6 +364,15 @@ pub struct DataLoader {
 
 const UNKNOWN_WORKSPACE_LABEL: &str = "Unknown workspace";
 const UNKNOWN_WORKSPACE_GROUP_KEY: &str = "\0unknown-workspace";
+const UNATTRIBUTED_CODEX_ACCOUNT: &str = "unattributed";
+const CODEX_MONTHLY_SUBSCRIPTION_COST_USD: f64 = 200.0;
+
+fn is_billable_codex_account_bucket(account_hash: &str) -> bool {
+    !matches!(
+        account_hash,
+        UNATTRIBUTED_CODEX_ACCOUNT | "mixed" | "ledger_error"
+    )
+}
 
 fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
     match (&msg.workspace_key, &msg.workspace_label) {
@@ -286,21 +502,34 @@ impl DataLoader {
             scanner_settings: data_loader_scanner_settings(),
         };
 
-        let messages = if Handle::try_current().is_ok() {
+        let (usage, pricing) = if Handle::try_current().is_ok() {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let rt = Runtime::new().map_err(|e| e.to_string())?;
-                    rt.block_on(parse_local_unified_messages(opts))
+                    let pricing = rt.block_on(load_pricing_for_display());
+                    let usage =
+                        rt.block_on(parse_local_usage_with_pricing(opts, pricing.as_deref()))?;
+                    Ok((usage, pricing))
                 })
                 .join()
                 .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
             })
         } else {
-            Runtime::new()?.block_on(parse_local_unified_messages(opts))
+            let rt = Runtime::new()?;
+            let pricing = rt.block_on(load_pricing_for_display());
+            let usage = rt
+                .block_on(parse_local_usage_with_pricing(opts, pricing.as_deref()))
+                .map_err(anyhow::Error::msg)?;
+            Ok((usage, pricing))
         }
         .map_err(anyhow::Error::msg)?;
 
-        self.aggregate_messages(messages, group_by)
+        self.aggregate_messages_with_pricing(
+            usage.messages,
+            usage.quota_samples,
+            group_by,
+            pricing.as_deref(),
+        )
     }
 
     #[cfg(test)]
@@ -335,11 +564,11 @@ impl DataLoader {
             scanner_settings: data_loader_scanner_settings(),
         };
 
-        let messages = if Handle::try_current().is_ok() {
+        let usage = if Handle::try_current().is_ok() {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let rt = Runtime::new().map_err(|e| e.to_string())?;
-                    rt.block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+                    rt.block_on(tokscale_core::parse_local_usage_with_pricing(
                         opts,
                         Some(pricing),
                     ))
@@ -348,20 +577,36 @@ impl DataLoader {
                 .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
             })
         } else {
-            Runtime::new()?.block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+            Runtime::new()?.block_on(tokscale_core::parse_local_usage_with_pricing(
                 opts,
                 Some(pricing),
             ))
         }
         .map_err(anyhow::Error::msg)?;
 
-        self.aggregate_messages(messages, group_by)
+        self.aggregate_messages_with_pricing(
+            usage.messages,
+            usage.quota_samples,
+            group_by,
+            Some(pricing),
+        )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn aggregate_messages(
         &self,
         messages: Vec<UnifiedMessage>,
         group_by: &GroupBy,
+    ) -> Result<UsageData> {
+        self.aggregate_messages_with_pricing(messages, Vec::new(), group_by, None)
+    }
+
+    fn aggregate_messages_with_pricing(
+        &self,
+        messages: Vec<UnifiedMessage>,
+        quota_samples: Vec<CodexQuotaSample>,
+        group_by: &GroupBy,
+        pricing: Option<&PricingService>,
     ) -> Result<UsageData> {
         let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
         let mut agent_map: HashMap<String, AgentUsage> = HashMap::new();
@@ -369,6 +614,14 @@ impl DataLoader {
         let mut daily_map: HashMap<NaiveDate, DailyUsage> = HashMap::new();
         let mut hourly_map: HashMap<NaiveDateTime, HourlyUsage> = HashMap::new();
         let mut model_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        let prices_daily = build_price_rows(&messages, pricing);
+        let prices = build_price_summaries(&prices_daily);
+        let thinking_daily = build_thinking_rows(&messages);
+        let thinking = build_thinking_summaries(&thinking_daily);
+        let speeds_daily = build_speed_rows(&messages);
+        let speeds = build_speed_summaries(&speeds_daily);
+        let codex_accounts = build_codex_account_summaries(&messages);
+        let quota_value = build_quota_value_data(&messages, &quota_samples);
 
         for msg in &messages {
             let normalized_model = normalize_model_for_grouping(&msg.model_id);
@@ -747,6 +1000,14 @@ impl DataLoader {
             agents,
             daily,
             hourly,
+            prices,
+            prices_daily,
+            thinking,
+            thinking_daily,
+            speeds,
+            speeds_daily,
+            codex_accounts,
+            quota_value,
             graph: Some(graph),
             total_tokens,
             total_cost,
@@ -756,6 +1017,984 @@ impl DataLoader {
             longest_streak,
         })
     }
+}
+
+async fn load_pricing_for_display() -> Option<Arc<PricingService>> {
+    if std::env::var("TOKSCALE_PRICING_CACHE_ONLY")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+    {
+        return PricingService::load_cached_any_age().map(Arc::new);
+    }
+
+    PricingService::get_or_init()
+        .await
+        .ok()
+        .or_else(|| PricingService::load_cached_any_age().map(Arc::new))
+}
+
+fn build_price_rows(
+    messages: &[UnifiedMessage],
+    pricing: Option<&PricingService>,
+) -> Vec<PriceUsage> {
+    let mut price_map: HashMap<(NaiveDate, String), PriceUsage> = HashMap::new();
+
+    for msg in messages {
+        let Some(date) = parse_date(&msg.date) else {
+            continue;
+        };
+
+        let lookup = pricing.and_then(|svc| {
+            svc.lookup_with_source_and_provider(&msg.model_id, None, Some(&msg.provider_id))
+        });
+        let canonical_model = canonical_price_model(
+            &msg.model_id,
+            lookup.as_ref().map(|r| r.matched_key.as_str()),
+        );
+        let price_category = canonical_price_category(
+            &msg.model_id,
+            lookup.as_ref().map(|r| r.matched_key.as_str()),
+        );
+        let key = (date, price_category.clone());
+        let entry = price_map.entry(key).or_insert_with(|| PriceUsage {
+            date,
+            model: canonical_model,
+            provider: msg.provider_id.clone(),
+            pricing_source: lookup.as_ref().map(|result| result.source.clone()),
+            matched_key: Some(price_category.clone()),
+            tokens: TokenBreakdown::default(),
+            cost: 0.0,
+            clients: BTreeSet::new(),
+            message_count: 0,
+            input_price_per_million: lookup
+                .as_ref()
+                .and_then(|result| result.pricing.input_cost_per_token)
+                .map(|price| price * 1_000_000.0),
+            output_price_per_million: lookup
+                .as_ref()
+                .and_then(|result| result.pricing.output_cost_per_token)
+                .map(|price| price * 1_000_000.0),
+            cache_read_price_per_million: lookup
+                .as_ref()
+                .and_then(|result| result.pricing.cache_read_input_token_cost)
+                .map(|price| price * 1_000_000.0),
+            cache_write_price_per_million: lookup
+                .as_ref()
+                .and_then(|result| result.pricing.cache_creation_input_token_cost)
+                .map(|price| price * 1_000_000.0),
+        });
+
+        if !entry
+            .provider
+            .split(", ")
+            .any(|provider| provider == msg.provider_id)
+        {
+            entry.provider = format!("{}, {}", entry.provider, msg.provider_id);
+        }
+        match (
+            entry.pricing_source.as_deref(),
+            lookup.as_ref().map(|result| result.source.as_str()),
+        ) {
+            (None, Some(source)) => entry.pricing_source = Some(source.to_string()),
+            (Some(existing), Some(source)) if existing != source && existing != "Mixed" => {
+                entry.pricing_source = Some("Mixed".to_string())
+            }
+            _ => {}
+        }
+
+        entry.tokens.input = entry
+            .tokens
+            .input
+            .saturating_add(msg.tokens.input.max(0) as u64);
+        entry.tokens.output = entry
+            .tokens
+            .output
+            .saturating_add(msg.tokens.output.max(0) as u64);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(msg.tokens.cache_read.max(0) as u64);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(msg.tokens.cache_write.max(0) as u64);
+        entry.tokens.reasoning = entry
+            .tokens
+            .reasoning
+            .saturating_add(msg.tokens.reasoning.max(0) as u64);
+        entry.cost += if msg.cost.is_finite() && msg.cost >= 0.0 {
+            msg.cost
+        } else {
+            0.0
+        };
+        entry.clients.insert(msg.client.clone());
+        entry.message_count = entry
+            .message_count
+            .saturating_add(msg.message_count.max(0) as u32);
+    }
+
+    let mut prices: Vec<PriceUsage> = price_map.into_values().collect();
+    prices.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| b.cost.total_cmp(&a.cost))
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    prices
+}
+
+fn build_price_summaries(prices_daily: &[PriceUsage]) -> Vec<PriceSummary> {
+    let mut summary_map: HashMap<String, PriceSummary> = HashMap::new();
+
+    for row in prices_daily {
+        let entry = summary_map
+            .entry(row.model.clone())
+            .or_insert_with(|| PriceSummary {
+                model: row.model.clone(),
+                provider: row.provider.clone(),
+                pricing_source: row.pricing_source.clone(),
+                matched_key: row.matched_key.clone(),
+                latest_date: row.date,
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                clients: BTreeSet::new(),
+                message_count: 0,
+                input_price_per_million: row.input_price_per_million,
+                output_price_per_million: row.output_price_per_million,
+                cache_read_price_per_million: row.cache_read_price_per_million,
+                cache_write_price_per_million: row.cache_write_price_per_million,
+            });
+
+        if row.date > entry.latest_date {
+            entry.latest_date = row.date;
+            entry.input_price_per_million = row.input_price_per_million;
+            entry.output_price_per_million = row.output_price_per_million;
+            entry.cache_read_price_per_million = row.cache_read_price_per_million;
+            entry.cache_write_price_per_million = row.cache_write_price_per_million;
+        }
+
+        if !entry
+            .provider
+            .split(", ")
+            .any(|provider| provider == row.provider)
+        {
+            entry.provider = format!("{}, {}", entry.provider, row.provider);
+        }
+        match (
+            entry.pricing_source.as_deref(),
+            row.pricing_source.as_deref(),
+        ) {
+            (None, Some(source)) => entry.pricing_source = Some(source.to_string()),
+            (Some(existing), Some(source)) if existing != source && existing != "Mixed" => {
+                entry.pricing_source = Some("Mixed".to_string())
+            }
+            _ => {}
+        }
+
+        entry.tokens.input = entry.tokens.input.saturating_add(row.tokens.input);
+        entry.tokens.output = entry.tokens.output.saturating_add(row.tokens.output);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(row.tokens.cache_read);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(row.tokens.cache_write);
+        entry.tokens.reasoning = entry.tokens.reasoning.saturating_add(row.tokens.reasoning);
+        entry.cost += row.cost;
+        entry.clients.extend(row.clients.iter().cloned());
+        entry.message_count = entry.message_count.saturating_add(row.message_count);
+    }
+
+    let mut summaries: Vec<PriceSummary> = summary_map.into_values().collect();
+    summaries.sort_by(|a, b| a.model.cmp(&b.model));
+    summaries
+}
+
+fn canonical_price_model(model_id: &str, matched_key: Option<&str>) -> String {
+    normalize_model_for_grouping(
+        matched_key
+            .map(strip_pricing_provider_prefix)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(model_id),
+    )
+}
+
+fn canonical_price_category(model_id: &str, matched_key: Option<&str>) -> String {
+    matched_key
+        .map(strip_pricing_provider_prefix)
+        .filter(|value| !value.is_empty())
+        .map(normalize_model_for_grouping)
+        .unwrap_or_else(|| normalize_model_for_grouping(model_id))
+}
+
+fn strip_pricing_provider_prefix(key: &str) -> &str {
+    key.rsplit_once('/')
+        .map(|(_, model)| model)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(key)
+}
+
+fn build_thinking_rows(messages: &[UnifiedMessage]) -> Vec<ThinkingUsage> {
+    let mut thinking_map: HashMap<(NaiveDate, String, String, String), ThinkingUsage> =
+        HashMap::new();
+
+    for msg in messages {
+        if msg.tokens.output <= 0 && msg.tokens.reasoning <= 0 {
+            continue;
+        }
+
+        let Some(date) = parse_date(&msg.date) else {
+            continue;
+        };
+
+        let normalized_model = normalize_model_for_grouping(&msg.model_id);
+        let (base_model, thinking_level) = split_thinking_level(&normalized_model);
+        let key = (
+            date,
+            msg.provider_id.clone(),
+            base_model.clone(),
+            thinking_level.clone(),
+        );
+
+        let entry = thinking_map.entry(key).or_insert_with(|| ThinkingUsage {
+            date,
+            model: base_model,
+            provider: msg.provider_id.clone(),
+            thinking_level,
+            tokens: TokenBreakdown::default(),
+            cost: 0.0,
+            clients: BTreeSet::new(),
+            message_count: 0,
+        });
+
+        entry.tokens.input = entry
+            .tokens
+            .input
+            .saturating_add(msg.tokens.input.max(0) as u64);
+        entry.tokens.output = entry
+            .tokens
+            .output
+            .saturating_add(msg.tokens.output.max(0) as u64);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(msg.tokens.cache_read.max(0) as u64);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(msg.tokens.cache_write.max(0) as u64);
+        entry.tokens.reasoning = entry
+            .tokens
+            .reasoning
+            .saturating_add(msg.tokens.reasoning.max(0) as u64);
+        entry.cost += if msg.cost.is_finite() && msg.cost >= 0.0 {
+            msg.cost
+        } else {
+            0.0
+        };
+        entry.clients.insert(msg.client.clone());
+        entry.message_count = entry
+            .message_count
+            .saturating_add(msg.message_count.max(0) as u32);
+    }
+
+    let mut thinking: Vec<ThinkingUsage> = thinking_map.into_values().collect();
+    thinking.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| {
+                (b.tokens.output.saturating_add(b.tokens.reasoning))
+                    .cmp(&a.tokens.output.saturating_add(a.tokens.reasoning))
+            })
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.thinking_level.cmp(&b.thinking_level))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    thinking
+}
+
+fn build_thinking_summaries(thinking_daily: &[ThinkingUsage]) -> Vec<ThinkingSummary> {
+    let mut summary_map: HashMap<String, ThinkingSummary> = HashMap::new();
+    let mut trend_windows: HashMap<String, (NaiveDate, TokenBreakdown)> = HashMap::new();
+
+    for row in thinking_daily {
+        let entry = summary_map
+            .entry(row.model.clone())
+            .or_insert_with(|| ThinkingSummary {
+                model: row.model.clone(),
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                clients: BTreeSet::new(),
+                message_count: 0,
+                thirty_day_trend_pct: None,
+            });
+
+        entry.tokens.input = entry.tokens.input.saturating_add(row.tokens.input);
+        entry.tokens.output = entry.tokens.output.saturating_add(row.tokens.output);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(row.tokens.cache_read);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(row.tokens.cache_write);
+        entry.tokens.reasoning = entry.tokens.reasoning.saturating_add(row.tokens.reasoning);
+        entry.cost += row.cost;
+        entry.clients.extend(row.clients.iter().cloned());
+        entry.message_count = entry.message_count.saturating_add(row.message_count);
+
+        let trend_entry = trend_windows
+            .entry(row.model.clone())
+            .or_insert_with(|| (row.date, TokenBreakdown::default()));
+        if row.date > trend_entry.0 {
+            trend_entry.0 = row.date;
+        }
+    }
+
+    for row in thinking_daily {
+        let Some((latest_date, _)) = trend_windows.get(&row.model) else {
+            continue;
+        };
+        let recent_start = latest_date
+            .checked_sub_signed(Duration::days(29))
+            .unwrap_or(*latest_date);
+        let previous_start = recent_start
+            .checked_sub_signed(Duration::days(30))
+            .unwrap_or(recent_start);
+
+        let trend_entry = trend_windows.get_mut(&row.model).expect("entry exists");
+        if row.date >= previous_start && row.date < recent_start {
+            trend_entry.1.output = trend_entry.1.output.saturating_add(row.tokens.output);
+            trend_entry.1.reasoning = trend_entry.1.reasoning.saturating_add(row.tokens.reasoning);
+        }
+    }
+
+    for summary in summary_map.values_mut() {
+        let Some((latest_date, previous_tokens)) = trend_windows.get(&summary.model) else {
+            continue;
+        };
+        let recent_start = latest_date
+            .checked_sub_signed(Duration::days(29))
+            .unwrap_or(*latest_date);
+        let mut recent_tokens = TokenBreakdown::default();
+
+        for row in thinking_daily
+            .iter()
+            .filter(|row| row.model == summary.model)
+        {
+            if row.date >= recent_start && row.date <= *latest_date {
+                recent_tokens.output = recent_tokens.output.saturating_add(row.tokens.output);
+                recent_tokens.reasoning =
+                    recent_tokens.reasoning.saturating_add(row.tokens.reasoning);
+            }
+        }
+
+        summary.thirty_day_trend_pct =
+            calculate_thirty_day_trend_pct(&recent_tokens, previous_tokens);
+    }
+
+    let mut summaries: Vec<ThinkingSummary> = summary_map.into_values().collect();
+    summaries.sort_by(|a, b| a.model.cmp(&b.model));
+    summaries
+}
+
+fn build_speed_rows(messages: &[UnifiedMessage]) -> Vec<SpeedUsage> {
+    let mut speed_map: HashMap<(NaiveDate, String, String, String), SpeedUsage> = HashMap::new();
+
+    for msg in messages {
+        let generated_tokens = msg
+            .tokens
+            .output
+            .max(0)
+            .saturating_add(msg.tokens.reasoning.max(0)) as u64;
+        let Some(duration_ms) = msg.generation_duration_ms else {
+            continue;
+        };
+        if !has_reasonable_tokens_per_second(generated_tokens, duration_ms) {
+            continue;
+        }
+
+        let Some(date) = parse_date(&msg.date) else {
+            continue;
+        };
+
+        let normalized_model = normalize_model_for_grouping(&msg.model_id);
+        let (base_model, thinking_level) = split_thinking_level(&normalized_model);
+        let key = (
+            date,
+            msg.provider_id.clone(),
+            base_model.clone(),
+            thinking_level.clone(),
+        );
+
+        let entry = speed_map.entry(key).or_insert_with(|| SpeedUsage {
+            date,
+            model: base_model,
+            provider: msg.provider_id.clone(),
+            thinking_level,
+            generated_tokens: 0,
+            generation_duration_ms: 0,
+            clients: BTreeSet::new(),
+            sample_count: 0,
+        });
+
+        entry.generated_tokens = entry.generated_tokens.saturating_add(generated_tokens);
+        entry.generation_duration_ms = entry.generation_duration_ms.saturating_add(duration_ms);
+        entry.clients.insert(msg.client.clone());
+        entry.sample_count = entry.sample_count.saturating_add(1);
+    }
+
+    let mut speeds: Vec<SpeedUsage> = speed_map.into_values().collect();
+    speeds.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| b.tokens_per_second().total_cmp(&a.tokens_per_second()))
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.thinking_level.cmp(&b.thinking_level))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    speeds
+}
+
+fn build_speed_summaries(speeds_daily: &[SpeedUsage]) -> Vec<SpeedSummary> {
+    let mut summary_map: HashMap<(String, String, String), SpeedSummary> = HashMap::new();
+
+    for row in speeds_daily {
+        let key = (
+            row.provider.clone(),
+            row.model.clone(),
+            row.thinking_level.clone(),
+        );
+        let entry = summary_map.entry(key).or_insert_with(|| SpeedSummary {
+            model: row.model.clone(),
+            provider: row.provider.clone(),
+            thinking_level: row.thinking_level.clone(),
+            latest_date: row.date,
+            generated_tokens: 0,
+            generation_duration_ms: 0,
+            clients: BTreeSet::new(),
+            sample_count: 0,
+        });
+
+        if row.date > entry.latest_date {
+            entry.latest_date = row.date;
+        }
+        entry.generated_tokens = entry.generated_tokens.saturating_add(row.generated_tokens);
+        entry.generation_duration_ms = entry
+            .generation_duration_ms
+            .saturating_add(row.generation_duration_ms);
+        entry.clients.extend(row.clients.iter().cloned());
+        entry.sample_count = entry.sample_count.saturating_add(row.sample_count);
+    }
+
+    let mut summaries: Vec<SpeedSummary> = summary_map.into_values().collect();
+    summaries.sort_by(|a, b| {
+        b.tokens_per_second()
+            .total_cmp(&a.tokens_per_second())
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.thinking_level.cmp(&b.thinking_level))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    summaries
+}
+
+fn calculate_thirty_day_trend_pct(
+    recent: &TokenBreakdown,
+    previous: &TokenBreakdown,
+) -> Option<f64> {
+    let recent_generated = recent.output.saturating_add(recent.reasoning);
+    let previous_generated = previous.output.saturating_add(previous.reasoning);
+    if recent_generated == 0 && previous_generated == 0 {
+        return Some(0.0);
+    }
+    if previous_generated == 0 || previous.reasoning == 0 {
+        return None;
+    }
+
+    let recent_rate = recent.reasoning as f64 / recent_generated as f64;
+    let previous_rate = previous.reasoning as f64 / previous_generated as f64;
+    if previous_rate <= f64::EPSILON {
+        return None;
+    }
+
+    Some(((recent_rate - previous_rate) / previous_rate) * 100.0)
+}
+
+fn build_codex_account_summaries(messages: &[UnifiedMessage]) -> Vec<CodexAccountUsage> {
+    let mut account_map: HashMap<String, CodexAccountUsage> = HashMap::new();
+    let mut account_sessions: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut account_months: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for msg in messages {
+        if msg.client != "codex" {
+            continue;
+        }
+
+        let account_hash = msg
+            .codex_account_hash
+            .clone()
+            .unwrap_or_else(|| UNATTRIBUTED_CODEX_ACCOUNT.to_string());
+        let tracks_subscription = is_billable_codex_account_bucket(&account_hash);
+        let entry = account_map
+            .entry(account_hash.clone())
+            .or_insert_with(|| CodexAccountUsage {
+                account_hash: account_hash.clone(),
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                paid_cost: tracks_subscription.then_some(0.0),
+                active_month_count: tracks_subscription.then_some(0),
+                message_count: 0,
+                turn_count: 0,
+                session_count: 0,
+                first_date: None,
+                latest_date: None,
+            });
+
+        entry.tokens.input = entry
+            .tokens
+            .input
+            .saturating_add(msg.tokens.input.max(0) as u64);
+        entry.tokens.output = entry
+            .tokens
+            .output
+            .saturating_add(msg.tokens.output.max(0) as u64);
+        entry.tokens.cache_read = entry
+            .tokens
+            .cache_read
+            .saturating_add(msg.tokens.cache_read.max(0) as u64);
+        entry.tokens.cache_write = entry
+            .tokens
+            .cache_write
+            .saturating_add(msg.tokens.cache_write.max(0) as u64);
+        entry.tokens.reasoning = entry
+            .tokens
+            .reasoning
+            .saturating_add(msg.tokens.reasoning.max(0) as u64);
+        entry.cost += if msg.cost.is_finite() && msg.cost >= 0.0 {
+            msg.cost
+        } else {
+            0.0
+        };
+        entry.message_count = entry
+            .message_count
+            .saturating_add(msg.message_count.max(0) as u32);
+        if msg.is_turn_start {
+            entry.turn_count = entry.turn_count.saturating_add(1);
+        }
+        if let Some(date) = parse_date(&msg.date) {
+            entry.first_date = Some(entry.first_date.map_or(date, |current| current.min(date)));
+            entry.latest_date = Some(entry.latest_date.map_or(date, |current| current.max(date)));
+            if tracks_subscription {
+                let months = account_months.entry(account_hash.clone()).or_default();
+                if months.insert(format!("{}-{:02}", date.year(), date.month())) {
+                    if let Some(month_count) = entry.active_month_count.as_mut() {
+                        *month_count = month_count.saturating_add(1);
+                    }
+                    if let Some(paid_cost) = entry.paid_cost.as_mut() {
+                        *paid_cost += CODEX_MONTHLY_SUBSCRIPTION_COST_USD;
+                    }
+                }
+            }
+        }
+
+        let sessions = account_sessions.entry(account_hash).or_default();
+        if sessions.insert(msg.session_id.clone()) {
+            entry.session_count = entry.session_count.saturating_add(1);
+        }
+    }
+
+    let mut accounts: Vec<CodexAccountUsage> = account_map.into_values().collect();
+    accounts.sort_by(|a, b| {
+        b.cost
+            .total_cmp(&a.cost)
+            .then_with(|| b.tokens.total().cmp(&a.tokens.total()))
+            .then_with(|| a.account_hash.cmp(&b.account_hash))
+    });
+    accounts
+}
+
+fn build_quota_value_data(
+    messages: &[UnifiedMessage],
+    samples: &[CodexQuotaSample],
+) -> QuotaValueData {
+    if samples.is_empty() {
+        return QuotaValueData::default();
+    }
+
+    let mut grouped_samples: BTreeMap<(String, String, i64, i64), Vec<&CodexQuotaSample>> =
+        BTreeMap::new();
+    for sample in samples {
+        let account_hash = sample
+            .codex_account_hash
+            .clone()
+            .unwrap_or_else(|| UNATTRIBUTED_CODEX_ACCOUNT.to_string());
+        grouped_samples
+            .entry((
+                account_hash,
+                sample.window_kind.clone(),
+                sample.resets_at,
+                sample.window_minutes,
+            ))
+            .or_default()
+            .push(sample);
+    }
+
+    let mut intervals = Vec::new();
+    for ((account_hash, window_kind, _resets_at, window_minutes), mut group) in grouped_samples {
+        group.sort_by_key(|sample| sample.timestamp);
+        for pair in group.windows(2) {
+            let start = pair[0];
+            let end = pair[1];
+            let quota_burn_pct = end.used_percent - start.used_percent;
+            if quota_burn_pct <= 0.0 || !quota_burn_pct.is_finite() {
+                continue;
+            }
+
+            let mut per_model: BTreeMap<String, (TokenBreakdown, f64)> = BTreeMap::new();
+            let mut models = BTreeSet::new();
+            for message in messages {
+                if message.client != "codex" {
+                    continue;
+                }
+                let message_account = message
+                    .codex_account_hash
+                    .clone()
+                    .unwrap_or_else(|| UNATTRIBUTED_CODEX_ACCOUNT.to_string());
+                if message_account != account_hash {
+                    continue;
+                }
+                if message.timestamp <= start.timestamp || message.timestamp > end.timestamp {
+                    continue;
+                }
+
+                let model = normalize_model_for_grouping(&message.model_id);
+                let (tokens, api_value_usd) = per_model.entry(model.clone()).or_default();
+                tokens.input = tokens
+                    .input
+                    .saturating_add(message.tokens.input.max(0) as u64);
+                tokens.output = tokens
+                    .output
+                    .saturating_add(message.tokens.output.max(0) as u64);
+                tokens.cache_read = tokens
+                    .cache_read
+                    .saturating_add(message.tokens.cache_read.max(0) as u64);
+                tokens.cache_write = tokens
+                    .cache_write
+                    .saturating_add(message.tokens.cache_write.max(0) as u64);
+                tokens.reasoning = tokens
+                    .reasoning
+                    .saturating_add(message.tokens.reasoning.max(0) as u64);
+                if message.cost.is_finite() && message.cost > 0.0 {
+                    *api_value_usd += message.cost;
+                }
+                models.insert(model);
+            }
+
+            if let Some(end_dt) = timestamp_to_local_datetime(end.timestamp) {
+                let total_tokens = per_model
+                    .values()
+                    .map(|(tokens, _)| tokens.total())
+                    .sum::<u64>();
+                let model_count = per_model.len().max(1) as f64;
+                for (model, (tokens, api_value_usd)) in per_model {
+                    let token_share = if total_tokens > 0 {
+                        tokens.total() as f64 / total_tokens as f64
+                    } else {
+                        1.0 / model_count
+                    };
+                    let model_quota_burn_pct = quota_burn_pct * token_share;
+                    let subscription_cost_burned =
+                        subscription_cost_burned(window_minutes, model_quota_burn_pct);
+                    let factor = positive_ratio(api_value_usd, subscription_cost_burned);
+                    let dollars_per_percent = positive_ratio(api_value_usd, model_quota_burn_pct);
+                    intervals.push(QuotaValueInterval {
+                        account_hash: account_hash.clone(),
+                        model,
+                        window_kind: window_kind.clone(),
+                        end: end_dt,
+                        quota_burn_pct: model_quota_burn_pct,
+                        api_value_usd,
+                        subscription_cost_burned,
+                        factor,
+                        dollars_per_percent,
+                        tokens,
+                        models: models.clone(),
+                        sample_count: 2,
+                        confidence: QuotaConfidence::Low,
+                    });
+                }
+            }
+        }
+    }
+
+    intervals.sort_by_key(|interval| interval.end);
+    let points = build_quota_value_points(&intervals);
+    let model_summaries = build_quota_model_summaries(&intervals, &points);
+    let point_confidence: HashMap<(NaiveDate, String, String), QuotaConfidence> = points
+        .iter()
+        .map(|point| {
+            (
+                (point.date, point.model.clone(), point.window_kind.clone()),
+                point.confidence,
+            )
+        })
+        .collect();
+    for interval in &mut intervals {
+        if let Some(confidence) = point_confidence.get(&(
+            interval.end.date(),
+            interval.model.clone(),
+            interval.window_kind.clone(),
+        )) {
+            interval.confidence = *confidence;
+        }
+    }
+    intervals.sort_by_key(|interval| std::cmp::Reverse(interval.end));
+
+    QuotaValueData {
+        intervals,
+        points,
+        model_summaries,
+        sample_count: samples.len() as u32,
+    }
+}
+
+fn build_quota_value_points(intervals: &[QuotaValueInterval]) -> Vec<QuotaValuePoint> {
+    let mut dates = BTreeSet::new();
+    let mut models = BTreeSet::new();
+    let mut window_kinds = BTreeSet::new();
+    for interval in intervals {
+        dates.insert(interval.end.date());
+        models.insert(interval.model.clone());
+        window_kinds.insert(interval.window_kind.clone());
+    }
+
+    let mut points = Vec::new();
+    for date in dates {
+        let start = date - Duration::days(3);
+        for model in &models {
+            for window_kind in &window_kinds {
+                let window: Vec<&QuotaValueInterval> = intervals
+                    .iter()
+                    .filter(|interval| {
+                        interval.model == *model
+                            && interval.window_kind == *window_kind
+                            && interval.end.date() >= start
+                            && interval.end.date() <= date
+                    })
+                    .collect();
+                if window.is_empty() {
+                    continue;
+                }
+                let quota_burn_pct: f64 =
+                    window.iter().map(|interval| interval.quota_burn_pct).sum();
+                let api_value_usd: f64 = window.iter().map(|interval| interval.api_value_usd).sum();
+                let subscription_cost_burned: f64 = window
+                    .iter()
+                    .map(|interval| interval.subscription_cost_burned)
+                    .sum();
+                let interval_count = window.len() as u32;
+                points.push(QuotaValuePoint {
+                    date,
+                    model: model.clone(),
+                    window_kind: window_kind.clone(),
+                    quota_burn_pct,
+                    api_value_usd,
+                    subscription_cost_burned,
+                    factor: positive_ratio(api_value_usd, subscription_cost_burned),
+                    dollars_per_percent: positive_ratio(api_value_usd, quota_burn_pct),
+                    interval_count,
+                    confidence: quota_confidence(interval_count, quota_burn_pct),
+                });
+            }
+        }
+    }
+    points.sort_by(|a, b| {
+        a.date
+            .cmp(&b.date)
+            .then_with(|| a.model.cmp(&b.model))
+            .then_with(|| a.window_kind.cmp(&b.window_kind))
+    });
+    points
+}
+
+fn build_quota_model_summaries(
+    intervals: &[QuotaValueInterval],
+    points: &[QuotaValuePoint],
+) -> Vec<QuotaModelSummary> {
+    let mut latest_by_model: BTreeMap<String, &QuotaValuePoint> = BTreeMap::new();
+    for point in points {
+        let current = latest_by_model.get(&point.model).copied();
+        let should_replace = match current {
+            None => true,
+            Some(existing) => {
+                (point.window_kind == "secondary" && existing.window_kind != "secondary")
+                    || (point.window_kind == existing.window_kind && point.date > existing.date)
+                    || (point.date > existing.date && existing.window_kind != "secondary")
+            }
+        };
+        if should_replace {
+            latest_by_model.insert(point.model.clone(), point);
+        }
+    }
+
+    let mut summaries = Vec::new();
+    for point in latest_by_model.into_values() {
+        let start = point.date - Duration::days(3);
+        let mut tokens = TokenBreakdown::default();
+        for interval in intervals {
+            if interval.model != point.model
+                || interval.window_kind != point.window_kind
+                || interval.end.date() < start
+                || interval.end.date() > point.date
+            {
+                continue;
+            }
+            tokens.input = tokens.input.saturating_add(interval.tokens.input);
+            tokens.output = tokens.output.saturating_add(interval.tokens.output);
+            tokens.cache_read = tokens.cache_read.saturating_add(interval.tokens.cache_read);
+            tokens.cache_write = tokens
+                .cache_write
+                .saturating_add(interval.tokens.cache_write);
+            tokens.reasoning = tokens.reasoning.saturating_add(interval.tokens.reasoning);
+        }
+
+        summaries.push(QuotaModelSummary {
+            model: point.model.clone(),
+            window_kind: point.window_kind.clone(),
+            latest_date: point.date,
+            quota_burn_pct: point.quota_burn_pct,
+            api_value_usd: point.api_value_usd,
+            subscription_cost_burned: point.subscription_cost_burned,
+            factor: point.factor,
+            dollars_per_percent: point.dollars_per_percent,
+            tokens,
+            interval_count: point.interval_count,
+            confidence: point.confidence,
+        });
+    }
+    summaries.sort_by(|a, b| {
+        b.api_value_usd
+            .total_cmp(&a.api_value_usd)
+            .then_with(|| b.factor.unwrap_or(0.0).total_cmp(&a.factor.unwrap_or(0.0)))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    summaries
+}
+
+fn positive_ratio(numerator: f64, denominator: f64) -> Option<f64> {
+    (numerator.is_finite() && denominator.is_finite() && denominator > 0.0)
+        .then_some(numerator / denominator)
+}
+
+fn subscription_cost_burned(window_minutes: i64, quota_burn_pct: f64) -> f64 {
+    const AVERAGE_MONTH_MINUTES: f64 = 365.2425 / 12.0 * 24.0 * 60.0;
+    let window_budget =
+        CODEX_MONTHLY_SUBSCRIPTION_COST_USD * window_minutes as f64 / AVERAGE_MONTH_MINUTES;
+    window_budget * quota_burn_pct / 100.0
+}
+
+fn quota_confidence(interval_count: u32, quota_burn_pct: f64) -> QuotaConfidence {
+    if interval_count >= 3 && quota_burn_pct >= 2.0 {
+        QuotaConfidence::High
+    } else if interval_count >= 2 && quota_burn_pct >= 1.0 {
+        QuotaConfidence::Medium
+    } else {
+        QuotaConfidence::Low
+    }
+}
+
+fn timestamp_to_local_datetime(timestamp_ms: i64) -> Option<NaiveDateTime> {
+    use chrono::TimeZone;
+    if timestamp_ms <= 0 {
+        return None;
+    }
+    match Local.timestamp_millis_opt(timestamp_ms) {
+        chrono::LocalResult::Single(dt) => Some(dt.naive_local()),
+        _ => None,
+    }
+}
+
+fn split_thinking_level(model: &str) -> (String, String) {
+    let lower = model.to_lowercase();
+
+    if let Some((base, tail)) = split_suffix_tail(model, &lower, "-thinking-")
+        .or_else(|| split_suffix_tail(model, &lower, "_thinking_"))
+    {
+        return (base, format!("Thinking {}", format_effort_label(&tail)));
+    }
+
+    for needle in ["-thinking", "_thinking"] {
+        if lower.ends_with(needle) {
+            return (
+                model[..model.len() - needle.len()].to_string(),
+                "Thinking".to_string(),
+            );
+        }
+    }
+
+    for (needle, label) in [
+        ("-xhigh", "XHigh"),
+        ("_xhigh", "XHigh"),
+        ("-high", "High"),
+        ("_high", "High"),
+        ("-medium", "Medium"),
+        ("_medium", "Medium"),
+        ("-low", "Low"),
+        ("_low", "Low"),
+    ] {
+        if lower.ends_with(needle) {
+            return (
+                model[..model.len() - needle.len()].to_string(),
+                label.to_string(),
+            );
+        }
+    }
+
+    (model.to_string(), "Default".to_string())
+}
+
+fn split_suffix_tail(model: &str, lower: &str, needle: &str) -> Option<(String, String)> {
+    let idx = lower.rfind(needle)?;
+    let tail_start = idx + needle.len();
+    if tail_start >= model.len() {
+        return None;
+    }
+    let tail = &model[tail_start..];
+    if tail.is_empty()
+        || !tail
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+    Some((model[..idx].to_string(), tail.to_string()))
+}
+
+fn format_effort_label(tail: &str) -> String {
+    tail.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part.chars().all(|ch| ch.is_ascii_digit()) {
+                part.to_string()
+            } else {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut label = String::new();
+                        label.push(first.to_ascii_uppercase());
+                        label.push_str(&chars.as_str().to_ascii_lowercase());
+                        label
+                    }
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_date(date_str: &str) -> Option<NaiveDate> {
@@ -1011,7 +2250,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
     use tokio::runtime::{Handle, Runtime};
-    use tokscale_core::parse_local_unified_messages_with_pricing;
+    use tokscale_core::parse_local_usage_with_pricing;
     use tokscale_core::pricing::{ModelPricing, PricingService};
     use tokscale_core::TokenBreakdown as CoreTokenBreakdown;
 
@@ -1077,21 +2316,26 @@ mod tests {
             scanner_settings: data_loader_scanner_settings(),
         };
 
-        let messages = if Handle::try_current().is_ok() {
+        let usage = if Handle::try_current().is_ok() {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let rt = Runtime::new().map_err(|e| e.to_string())?;
-                    rt.block_on(parse_local_unified_messages_with_pricing(opts, pricing))
+                    rt.block_on(parse_local_usage_with_pricing(opts, pricing))
                 })
                 .join()
                 .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
             })
         } else {
-            Runtime::new()?.block_on(parse_local_unified_messages_with_pricing(opts, pricing))
+            Runtime::new()?.block_on(parse_local_usage_with_pricing(opts, pricing))
         }
         .map_err(anyhow::Error::msg)?;
 
-        loader.aggregate_messages(messages, group_by)
+        loader.aggregate_messages_with_pricing(
+            usage.messages,
+            usage.quota_samples,
+            group_by,
+            pricing,
+        )
     }
 
     fn expected_message_cost(
@@ -1139,6 +2383,54 @@ mod tests {
             workspace_label.map(str::to_string),
         );
         msg
+    }
+
+    fn make_speed_message(
+        session_id: &str,
+        output_tokens: i64,
+        reasoning_tokens: i64,
+        duration_ms: u64,
+    ) -> UnifiedMessage {
+        let mut msg = UnifiedMessage::new(
+            "codex",
+            "gpt-5.4-high",
+            "openai",
+            session_id,
+            1_735_689_600_000,
+            tokscale_core::TokenBreakdown {
+                input: 10,
+                output: output_tokens,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: reasoning_tokens,
+            },
+            0.0,
+        );
+        msg.generation_duration_ms = Some(duration_ms);
+        msg
+    }
+
+    #[test]
+    fn test_speed_rows_keep_only_reasonable_tps_samples() {
+        let rows = build_speed_rows(&[
+            make_speed_message("too-slow", 100, 0, 10_000),
+            make_speed_message("reasonable-output", 100, 0, 2_000),
+            make_speed_message("reasonable-reasoning", 50, 50, 1_000),
+            make_speed_message("too-fast", 100, 0, 1),
+        ]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "gpt-5.4");
+        assert_eq!(rows[0].thinking_level, "High");
+        assert_eq!(rows[0].generated_tokens, 200);
+        assert_eq!(rows[0].generation_duration_ms, 3_000);
+        assert_eq!(rows[0].sample_count, 2);
+        assert!((rows[0].tokens_per_second() - 66.666_666_666_7).abs() < 1e-6);
+
+        let summaries = build_speed_summaries(&rows);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].generated_tokens, 200);
+        assert_eq!(summaries[0].sample_count, 2);
     }
 
     #[test]
@@ -1506,6 +2798,472 @@ mod tests {
         assert_eq!(usage.agents[0].message_count, 2);
         assert!((usage.agents[0].cost - 4.0).abs() < f64::EPSILON);
         assert_eq!(usage.agents[0].tokens.total(), 45);
+    }
+
+    #[test]
+    fn test_aggregate_messages_builds_codex_account_usage() {
+        let loader = DataLoader::new(None);
+        let mut attributed = UnifiedMessage::new(
+            "codex",
+            "gpt-5",
+            "openai",
+            "session-1",
+            1_735_689_600_000,
+            tokscale_core::TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 1,
+                cache_write: 0,
+                reasoning: 2,
+            },
+            1.5,
+        );
+        attributed.codex_account_hash = Some("abc123def456".to_string());
+        attributed.is_turn_start = true;
+
+        let mut same_session = UnifiedMessage::new(
+            "codex",
+            "gpt-5",
+            "openai",
+            "session-1",
+            1_735_689_700_000,
+            tokscale_core::TokenBreakdown {
+                input: 4,
+                output: 3,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 1,
+            },
+            0.5,
+        );
+        same_session.codex_account_hash = Some("abc123def456".to_string());
+
+        let unattributed = UnifiedMessage::new(
+            "codex",
+            "gpt-5",
+            "openai",
+            "session-2",
+            1_735_689_800_000,
+            tokscale_core::TokenBreakdown {
+                input: 2,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.25,
+        );
+
+        let usage = loader
+            .aggregate_messages(
+                vec![attributed, same_session, unattributed],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.codex_accounts.len(), 2);
+        let account = usage
+            .codex_accounts
+            .iter()
+            .find(|row| row.account_hash == "abc123def456")
+            .unwrap();
+        assert_eq!(account.tokens.total(), 26);
+        assert_eq!(account.session_count, 1);
+        assert_eq!(account.turn_count, 1);
+        assert_eq!(account.message_count, 2);
+        assert_eq!(account.active_month_count, Some(1));
+        assert!((account.cost - 2.0).abs() < f64::EPSILON);
+        assert_eq!(account.paid_cost, Some(200.0));
+
+        let unknown = usage
+            .codex_accounts
+            .iter()
+            .find(|row| row.account_hash == "unattributed")
+            .unwrap();
+        assert_eq!(unknown.session_count, 1);
+        assert_eq!(unknown.active_month_count, None);
+        assert_eq!(unknown.paid_cost, None);
+        assert_eq!(unknown.tokens.total(), 3);
+    }
+
+    #[test]
+    fn test_aggregate_messages_builds_price_rows_from_pricing() {
+        let loader = DataLoader::new(None);
+        let pricing = test_pricing_service();
+        let messages = vec![
+            UnifiedMessage::new(
+                "codex",
+                "claude-sonnet-4",
+                "anthropic",
+                "session-1",
+                1_735_689_600_000,
+                tokscale_core::TokenBreakdown {
+                    input: 100,
+                    output: 20,
+                    cache_read: 5,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            ),
+            UnifiedMessage::new(
+                "cursor",
+                "claude-sonnet-4",
+                "anthropic",
+                "session-2",
+                1_735_689_700_000,
+                tokscale_core::TokenBreakdown {
+                    input: 40,
+                    output: 10,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            ),
+        ];
+
+        let usage = loader
+            .aggregate_messages_with_pricing(messages, Vec::new(), &GroupBy::Model, Some(&pricing))
+            .unwrap();
+
+        assert_eq!(usage.prices.len(), 1);
+        let price_row = &usage.prices[0];
+        assert_eq!(price_row.model, "claude-sonnet-4");
+        assert_eq!(price_row.provider, "anthropic");
+        assert_eq!(price_row.pricing_source.as_deref(), Some("LiteLLM"));
+        assert_eq!(price_row.input_price_per_million, Some(10.0));
+        assert_eq!(price_row.output_price_per_million, Some(20.0));
+        assert_eq!(price_row.cache_read_price_per_million, Some(3.0));
+        assert_eq!(price_row.tokens.input, 140);
+        assert_eq!(price_row.tokens.output, 30);
+        assert_eq!(price_row.clients.len(), 2);
+    }
+
+    #[test]
+    fn test_quota_value_intervals_join_codex_cost_between_samples() {
+        let messages = vec![UnifiedMessage::new(
+            "codex",
+            "gpt-5.4",
+            "openai",
+            "session-1",
+            1_735_691_400_000,
+            tokscale_core::TokenBreakdown {
+                input: 100,
+                output: 25,
+                cache_read: 5,
+                cache_write: 0,
+                reasoning: 10,
+            },
+            3.50,
+        )];
+        let samples = vec![
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_689_600_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                10.0,
+                10080,
+                1_736_294_400_000,
+            ),
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_693_200_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                15.0,
+                10080,
+                1_736_294_400_000,
+            ),
+        ];
+
+        let quota = build_quota_value_data(&messages, &samples);
+
+        assert_eq!(quota.sample_count, 2);
+        assert_eq!(quota.intervals.len(), 1);
+        let interval = &quota.intervals[0];
+        assert_eq!(interval.window_kind, "secondary");
+        assert_eq!(interval.model, "gpt-5.4");
+        assert_eq!(interval.quota_burn_pct, 5.0);
+        assert_eq!(interval.api_value_usd, 3.50);
+        assert_eq!(interval.tokens.total(), 140);
+        assert!(interval.models.contains("gpt-5.4"));
+        assert!(interval.subscription_cost_burned > 0.0);
+        assert!(interval.factor.unwrap() > 0.0);
+        assert_eq!(quota.points.len(), 1);
+        assert_eq!(quota.points[0].model, "gpt-5.4");
+        assert_eq!(quota.points[0].interval_count, 1);
+        assert_eq!(quota.model_summaries.len(), 1);
+        assert_eq!(quota.model_summaries[0].model, "gpt-5.4");
+        assert_eq!(quota.model_summaries[0].tokens.total(), 140);
+    }
+
+    #[test]
+    fn test_quota_value_intervals_split_mixed_windows_by_model_tokens() {
+        let messages = vec![
+            UnifiedMessage::new(
+                "codex",
+                "gpt-5.4",
+                "openai",
+                "session-1",
+                1_735_691_400_000,
+                tokscale_core::TokenBreakdown {
+                    input: 75,
+                    output: 25,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                6.0,
+            ),
+            UnifiedMessage::new(
+                "codex",
+                "gpt-5.4-mini",
+                "openai",
+                "session-1",
+                1_735_691_500_000,
+                tokscale_core::TokenBreakdown {
+                    input: 25,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                1.0,
+            ),
+        ];
+        let samples = vec![
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_689_600_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                10.0,
+                10080,
+                1_736_294_400_000,
+            ),
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_693_200_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                15.0,
+                10080,
+                1_736_294_400_000,
+            ),
+        ];
+
+        let quota = build_quota_value_data(&messages, &samples);
+
+        assert_eq!(quota.intervals.len(), 2);
+        let gpt = quota
+            .intervals
+            .iter()
+            .find(|interval| interval.model == "gpt-5.4")
+            .unwrap();
+        let mini = quota
+            .intervals
+            .iter()
+            .find(|interval| interval.model == "gpt-5.4-mini")
+            .unwrap();
+        assert!((gpt.quota_burn_pct - 4.0).abs() < 1e-9);
+        assert!((mini.quota_burn_pct - 1.0).abs() < 1e-9);
+        assert_eq!(gpt.tokens.total(), 100);
+        assert_eq!(mini.tokens.total(), 25);
+        assert_eq!(quota.points.len(), 2);
+        assert_eq!(quota.model_summaries.len(), 2);
+    }
+
+    #[test]
+    fn test_quota_value_skips_zero_and_negative_burn_intervals() {
+        let samples = vec![
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_689_600_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                10.0,
+                10080,
+                1_736_294_400_000,
+            ),
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_693_200_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                10.0,
+                10080,
+                1_736_294_400_000,
+            ),
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_696_800_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                9.0,
+                10080,
+                1_736_294_400_000,
+            ),
+        ];
+
+        let quota = build_quota_value_data(&[], &samples);
+
+        assert_eq!(quota.sample_count, 3);
+        assert!(quota.intervals.is_empty());
+        assert!(quota.points.is_empty());
+    }
+
+    #[test]
+    fn test_quota_value_rolling_points_use_weighted_ratio() {
+        let samples = vec![
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_689_600_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                0.0,
+                10080,
+                1_736_294_400_000,
+            ),
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_693_200_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                1.0,
+                10080,
+                1_736_294_400_000,
+            ),
+            CodexQuotaSample::new(
+                "session-1",
+                1_735_776_000_000,
+                "openai",
+                "gpt-5.4",
+                "secondary",
+                3.0,
+                10080,
+                1_736_294_400_000,
+            ),
+        ];
+        let messages = vec![
+            UnifiedMessage::new(
+                "codex",
+                "gpt-5.4",
+                "openai",
+                "session-1",
+                1_735_691_400_000,
+                tokscale_core::TokenBreakdown {
+                    input: 10,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                1.0,
+            ),
+            UnifiedMessage::new(
+                "codex",
+                "gpt-5.4",
+                "openai",
+                "session-1",
+                1_735_734_000_000,
+                tokscale_core::TokenBreakdown {
+                    input: 20,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                9.0,
+            ),
+        ];
+
+        let quota = build_quota_value_data(&messages, &samples);
+
+        assert_eq!(quota.intervals.len(), 2);
+        let latest = quota.points.last().unwrap();
+        let expected_api: f64 = quota
+            .intervals
+            .iter()
+            .map(|interval| interval.api_value_usd)
+            .sum();
+        let expected_burned: f64 = quota
+            .intervals
+            .iter()
+            .map(|interval| interval.subscription_cost_burned)
+            .sum();
+        let expected_factor = expected_api / expected_burned;
+        let naive_factor_average = quota
+            .intervals
+            .iter()
+            .filter_map(|interval| interval.factor)
+            .sum::<f64>()
+            / quota.intervals.len() as f64;
+
+        assert_eq!(latest.interval_count, 2);
+        assert!((latest.factor.unwrap() - expected_factor).abs() < 1e-9);
+        assert!((latest.factor.unwrap() - naive_factor_average).abs() > 1e-6);
+    }
+
+    #[test]
+    fn test_aggregate_messages_dedupes_price_rows_by_canonical_model() {
+        let loader = DataLoader::new(None);
+        let messages = vec![
+            UnifiedMessage::new(
+                "codex",
+                "claude-sonnet-4-20250514",
+                "anthropic",
+                "session-1",
+                1_735_689_600_000,
+                tokscale_core::TokenBreakdown {
+                    input: 100,
+                    output: 20,
+                    cache_read: 5,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                1.0,
+            ),
+            UnifiedMessage::new(
+                "cursor",
+                "claude-sonnet-4-20250601",
+                "anthropic",
+                "session-2",
+                1_735_689_700_000,
+                tokscale_core::TokenBreakdown {
+                    input: 40,
+                    output: 10,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                2.0,
+            ),
+        ];
+
+        let usage = loader
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.prices.len(), 1);
+        let price_row = &usage.prices[0];
+        assert_eq!(price_row.model, "claude-sonnet-4");
+        assert_eq!(price_row.matched_key.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(price_row.provider, "anthropic");
+        assert_eq!(price_row.tokens.input, 140);
+        assert_eq!(price_row.tokens.output, 30);
+        assert!((price_row.cost - 3.0).abs() < f64::EPSILON);
+        assert_eq!(price_row.clients.len(), 2);
     }
 
     #[test]

@@ -12,7 +12,10 @@ use crate::ClientFilter;
 
 use ratatui::style::Color;
 
-use super::data::{AgentUsage, DailyUsage, DataLoader, HourlyUsage, ModelUsage, UsageData};
+use super::data::{
+    AgentUsage, CodexAccountUsage, DailyUsage, DataLoader, HourlyUsage, ModelUsage, PriceSummary,
+    SpeedSummary, ThinkingSummary, UsageData,
+};
 use super::settings::Settings;
 use super::themes::{Theme, ThemeName};
 use super::ui::dialog::{ClientPickerDialog, DialogStack};
@@ -36,6 +39,11 @@ pub enum Tab {
     Models,
     Daily,
     Hourly,
+    Prices,
+    Thinking,
+    Speeds,
+    Accounts,
+    Quota,
     Stats,
     Agents,
 }
@@ -47,6 +55,11 @@ impl Tab {
             Tab::Models,
             Tab::Daily,
             Tab::Hourly,
+            Tab::Prices,
+            Tab::Thinking,
+            Tab::Speeds,
+            Tab::Accounts,
+            Tab::Quota,
             Tab::Stats,
             Tab::Agents,
         ]
@@ -58,6 +71,11 @@ impl Tab {
             Tab::Models => "Models",
             Tab::Daily => "Daily",
             Tab::Hourly => "Hourly",
+            Tab::Prices => "Prices",
+            Tab::Thinking => "Thinking",
+            Tab::Speeds => "Speed",
+            Tab::Accounts => "Accounts",
+            Tab::Quota => "ROI",
             Tab::Stats => "Stats",
             Tab::Agents => "Agents",
         }
@@ -69,6 +87,11 @@ impl Tab {
             Tab::Models => "Mod",
             Tab::Daily => "Day",
             Tab::Hourly => "Hr",
+            Tab::Prices => "Prc",
+            Tab::Thinking => "Thk",
+            Tab::Speeds => "Tps",
+            Tab::Accounts => "Acct",
+            Tab::Quota => "ROI",
             Tab::Stats => "Sta",
             Tab::Agents => "Agt",
         }
@@ -79,7 +102,12 @@ impl Tab {
             Tab::Overview => Tab::Models,
             Tab::Models => Tab::Daily,
             Tab::Daily => Tab::Hourly,
-            Tab::Hourly => Tab::Stats,
+            Tab::Hourly => Tab::Prices,
+            Tab::Prices => Tab::Thinking,
+            Tab::Thinking => Tab::Speeds,
+            Tab::Speeds => Tab::Accounts,
+            Tab::Accounts => Tab::Quota,
+            Tab::Quota => Tab::Stats,
             Tab::Stats => Tab::Agents,
             Tab::Agents => Tab::Overview,
         }
@@ -91,7 +119,12 @@ impl Tab {
             Tab::Models => Tab::Overview,
             Tab::Daily => Tab::Models,
             Tab::Hourly => Tab::Daily,
-            Tab::Stats => Tab::Hourly,
+            Tab::Prices => Tab::Hourly,
+            Tab::Thinking => Tab::Prices,
+            Tab::Speeds => Tab::Thinking,
+            Tab::Accounts => Tab::Speeds,
+            Tab::Quota => Tab::Accounts,
+            Tab::Stats => Tab::Quota,
             Tab::Agents => Tab::Stats,
         }
     }
@@ -106,6 +139,7 @@ pub enum ChartGranularity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortField {
+    Model,
     Cost,
     Tokens,
     Date,
@@ -417,7 +451,11 @@ impl App {
                 self.set_sort(SortField::Tokens);
             }
             KeyCode::Char('d') => {
-                self.set_sort(SortField::Date);
+                self.set_sort(if matches!(self.current_tab, Tab::Thinking | Tab::Prices) {
+                    SortField::Model
+                } else {
+                    SortField::Date
+                });
             }
             KeyCode::Char('j') => {
                 self.jump_to_today();
@@ -594,6 +632,17 @@ impl App {
         self.sort_direction = dir;
     }
 
+    #[cfg(test)]
+    fn apply_tab_sort_defaults(&mut self) {
+        if self.current_tab == Tab::Hourly {
+            self.sort_field = SortField::Date;
+            self.sort_direction = SortDirection::Descending;
+        } else {
+            self.sort_field = SortField::Cost;
+            self.sort_direction = SortDirection::Descending;
+        }
+    }
+
     fn move_selection_up(&mut self) {
         if self.current_tab == Tab::Stats && self.selected_graph_cell.is_some() {
             let len = self.get_current_list_len();
@@ -707,6 +756,11 @@ impl App {
             Tab::Agents => self.data.agents.len(),
             Tab::Daily => self.data.daily.len(),
             Tab::Hourly => self.data.hourly.len(),
+            Tab::Prices => self.data.prices.len(),
+            Tab::Thinking => self.data.thinking.len(),
+            Tab::Speeds => self.data.speeds.len(),
+            Tab::Accounts => self.data.codex_accounts.len(),
+            Tab::Quota => self.data.quota_value.model_summaries.len(),
             Tab::Stats => {
                 if self.selected_graph_cell.is_some() {
                     self.stats_breakdown_total_lines
@@ -894,6 +948,75 @@ impl App {
                     h.cost
                 )
             }),
+            Tab::Prices => self.get_sorted_prices().get(self.selected_index).map(|p| {
+                format!(
+                    "{}: in {} out {} cost ${:.4}",
+                    p.model,
+                    p.input_price_per_million
+                        .map(|value| format!("${value:.2}/M"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    p.output_price_per_million
+                        .map(|value| format!("${value:.2}/M"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    p.cost
+                )
+            }),
+            Tab::Thinking => self
+                .get_sorted_thinking()
+                .get(self.selected_index)
+                .map(|t| {
+                    format!(
+                        "{}: output {} thinking {} cost ${:.4} trend {}",
+                        t.model,
+                        t.tokens.output,
+                        t.tokens.reasoning,
+                        t.cost,
+                        t.thirty_day_trend_pct
+                            .map(|value| format!("{value:+.1}%"))
+                            .unwrap_or_else(|| "—".to_string())
+                    )
+                }),
+            Tab::Speeds => self.get_sorted_speeds().get(self.selected_index).map(|s| {
+                format!(
+                    "{} {}: {:.1} tok/s over {} generated tokens",
+                    s.model,
+                    s.thinking_level,
+                    s.tokens_per_second(),
+                    s.generated_tokens
+                )
+            }),
+            Tab::Accounts => self
+                .get_sorted_codex_accounts()
+                .get(self.selected_index)
+                .map(|a| {
+                    let paid = a
+                        .paid_cost
+                        .map(|value| format!("paid ${value:.2}"))
+                        .unwrap_or_else(|| "paid n/a".to_string());
+                    format!(
+                        "{}: {} tokens, API ${:.4}, {}, {} sessions",
+                        format_codex_account_label(&a.account_hash),
+                        a.tokens.total(),
+                        a.cost,
+                        paid,
+                        a.session_count
+                    )
+                }),
+            Tab::Quota => self
+                .get_sorted_quota_model_summaries()
+                .get(self.selected_index)
+                .map(|q| {
+                    format!(
+                        "{} {}: API ${:.2}, sub ${:.2}, ROI {}",
+                        q.latest_date,
+                        q.model,
+                        q.api_value_usd,
+                        q.subscription_cost_burned,
+                        q.factor
+                            .map(|value| format!("{value:.1}x"))
+                            .unwrap_or_else(|| "n/a".to_string())
+                    )
+                }),
             Tab::Stats => None,
         };
 
@@ -965,6 +1088,9 @@ impl App {
             (SortField::Date, _) => {
                 models.sort_by(|a, b| tie_breaker(a, b));
             }
+            (SortField::Model, _) => {
+                models.sort_by(|a, b| tie_breaker(a, b));
+            }
         }
 
         models
@@ -1001,6 +1127,9 @@ impl App {
             (SortField::Date, _) => {
                 agents.sort_by(|a, b| tie_breaker(a, b));
             }
+            (SortField::Model, _) => {
+                agents.sort_by(|a, b| tie_breaker(a, b));
+            }
         }
 
         agents
@@ -1032,6 +1161,7 @@ impl App {
                 daily.sort_by_key(|b| std::cmp::Reverse(b.date))
             }
             (SortField::Date, SortDirection::Ascending) => daily.sort_by_key(|a| a.date),
+            (SortField::Model, _) => daily.sort_by_key(|b| std::cmp::Reverse(b.date)),
         }
 
         daily
@@ -1067,9 +1197,253 @@ impl App {
                 hourly.sort_by_key(|b| std::cmp::Reverse(b.datetime))
             }
             (SortField::Date, SortDirection::Ascending) => hourly.sort_by_key(|a| a.datetime),
+            (SortField::Model, _) => hourly.sort_by_key(|b| std::cmp::Reverse(b.datetime)),
         }
 
         hourly
+    }
+
+    pub fn get_sorted_prices(&self) -> Vec<&PriceSummary> {
+        let mut prices: Vec<&PriceSummary> = self.data.prices.iter().collect();
+
+        let tie_breaker = |a: &&PriceSummary, b: &&PriceSummary| {
+            a.model
+                .cmp(&b.model)
+                .then_with(|| a.provider.cmp(&b.provider))
+                .then_with(|| a.latest_date.cmp(&b.latest_date))
+                .then_with(|| a.pricing_source.cmp(&b.pricing_source))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => {
+                prices.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                prices.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => prices.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => prices.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Descending) => prices.sort_by(|a, b| {
+                b.latest_date
+                    .cmp(&a.latest_date)
+                    .then_with(|| a.model.cmp(&b.model))
+                    .then_with(|| a.provider.cmp(&b.provider))
+            }),
+            (SortField::Date, SortDirection::Ascending) => prices.sort_by(|a, b| {
+                a.latest_date
+                    .cmp(&b.latest_date)
+                    .then_with(|| a.model.cmp(&b.model))
+                    .then_with(|| a.provider.cmp(&b.provider))
+            }),
+            (SortField::Model, _) => prices.sort_by(|a, b| {
+                a.model
+                    .cmp(&b.model)
+                    .then_with(|| a.provider.cmp(&b.provider))
+                    .then_with(|| a.latest_date.cmp(&b.latest_date))
+            }),
+        }
+
+        prices
+    }
+
+    pub fn get_sorted_thinking(&self) -> Vec<&ThinkingSummary> {
+        let mut thinking: Vec<&ThinkingSummary> = self.data.thinking.iter().collect();
+        let generated_tokens =
+            |row: &&ThinkingSummary| row.tokens.output.saturating_add(row.tokens.reasoning);
+        let tie_breaker = |a: &&ThinkingSummary, b: &&ThinkingSummary| a.model.cmp(&b.model);
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Model, SortDirection::Ascending) => {
+                thinking.sort_by(|a, b| a.model.cmp(&b.model))
+            }
+            (SortField::Model, SortDirection::Descending) => {
+                thinking.sort_by(|a, b| b.model.cmp(&a.model))
+            }
+            (SortField::Cost, SortDirection::Descending) => {
+                thinking.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                thinking.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => thinking.sort_by(|a, b| {
+                generated_tokens(b)
+                    .cmp(&generated_tokens(a))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => thinking.sort_by(|a, b| {
+                generated_tokens(a)
+                    .cmp(&generated_tokens(b))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, _) => thinking.sort_by(|a, b| tie_breaker(a, b)),
+        }
+        thinking
+    }
+
+    pub fn get_sorted_speeds(&self) -> Vec<&SpeedSummary> {
+        let mut speeds: Vec<&SpeedSummary> = self.data.speeds.iter().collect();
+        let tie_breaker = |a: &&SpeedSummary, b: &&SpeedSummary| {
+            a.model
+                .cmp(&b.model)
+                .then_with(|| a.thinking_level.cmp(&b.thinking_level))
+                .then_with(|| a.provider.cmp(&b.provider))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Model, SortDirection::Ascending) => speeds.sort_by(tie_breaker),
+            (SortField::Model, SortDirection::Descending) => speeds.sort_by(|a, b| {
+                b.model
+                    .cmp(&a.model)
+                    .then_with(|| b.thinking_level.cmp(&a.thinking_level))
+                    .then_with(|| b.provider.cmp(&a.provider))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => speeds.sort_by(|a, b| {
+                b.generated_tokens
+                    .cmp(&a.generated_tokens)
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => speeds.sort_by(|a, b| {
+                a.generated_tokens
+                    .cmp(&b.generated_tokens)
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Descending) => speeds.sort_by(|a, b| {
+                b.latest_date
+                    .cmp(&a.latest_date)
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Ascending) => speeds.sort_by(|a, b| {
+                a.latest_date
+                    .cmp(&b.latest_date)
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Cost, SortDirection::Descending) => speeds.sort_by(|a, b| {
+                b.tokens_per_second()
+                    .total_cmp(&a.tokens_per_second())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => speeds.sort_by(|a, b| {
+                a.tokens_per_second()
+                    .total_cmp(&b.tokens_per_second())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+        }
+        speeds
+    }
+
+    pub fn get_sorted_codex_accounts(&self) -> Vec<&CodexAccountUsage> {
+        let mut accounts: Vec<&CodexAccountUsage> = self.data.codex_accounts.iter().collect();
+        let tie_breaker =
+            |a: &&CodexAccountUsage, b: &&CodexAccountUsage| a.account_hash.cmp(&b.account_hash);
+        let rank_cmp = |a: &&CodexAccountUsage, b: &&CodexAccountUsage| {
+            codex_account_sort_rank(&a.account_hash).cmp(&codex_account_sort_rank(&b.account_hash))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => accounts.sort_by(|a, b| {
+                rank_cmp(a, b)
+                    .then_with(|| b.cost.total_cmp(&a.cost))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => accounts.sort_by(|a, b| {
+                rank_cmp(a, b)
+                    .then_with(|| a.cost.total_cmp(&b.cost))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => accounts.sort_by(|a, b| {
+                rank_cmp(a, b)
+                    .then_with(|| b.tokens.total().cmp(&a.tokens.total()))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => accounts.sort_by(|a, b| {
+                rank_cmp(a, b)
+                    .then_with(|| a.tokens.total().cmp(&b.tokens.total()))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Descending) => accounts.sort_by(|a, b| {
+                rank_cmp(a, b)
+                    .then_with(|| b.latest_date.cmp(&a.latest_date))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Ascending) => accounts.sort_by(|a, b| {
+                rank_cmp(a, b)
+                    .then_with(|| a.latest_date.cmp(&b.latest_date))
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Model, SortDirection::Ascending) => {
+                accounts.sort_by(|a, b| rank_cmp(a, b).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Model, SortDirection::Descending) => accounts
+                .sort_by(|a, b| rank_cmp(a, b).then_with(|| b.account_hash.cmp(&a.account_hash))),
+        }
+
+        accounts
+    }
+
+    pub fn get_sorted_quota_model_summaries(&self) -> Vec<&super::data::QuotaModelSummary> {
+        let mut summaries: Vec<&super::data::QuotaModelSummary> =
+            self.data.quota_value.model_summaries.iter().collect();
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => summaries.sort_by(|a, b| {
+                b.api_value_usd
+                    .total_cmp(&a.api_value_usd)
+                    .then_with(|| b.factor.unwrap_or(0.0).total_cmp(&a.factor.unwrap_or(0.0)))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => summaries.sort_by(|a, b| {
+                a.api_value_usd
+                    .total_cmp(&b.api_value_usd)
+                    .then_with(|| b.factor.unwrap_or(0.0).total_cmp(&a.factor.unwrap_or(0.0)))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => summaries.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| b.api_value_usd.total_cmp(&a.api_value_usd))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => summaries.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| b.api_value_usd.total_cmp(&a.api_value_usd))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Date, SortDirection::Descending) => summaries.sort_by(|a, b| {
+                b.latest_date
+                    .cmp(&a.latest_date)
+                    .then_with(|| b.api_value_usd.total_cmp(&a.api_value_usd))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Date, SortDirection::Ascending) => summaries.sort_by(|a, b| {
+                a.latest_date
+                    .cmp(&b.latest_date)
+                    .then_with(|| b.api_value_usd.total_cmp(&a.api_value_usd))
+                    .then_with(|| a.model.cmp(&b.model))
+            }),
+            (SortField::Model, SortDirection::Ascending) => summaries.sort_by(|a, b| {
+                a.model
+                    .cmp(&b.model)
+                    .then_with(|| b.api_value_usd.total_cmp(&a.api_value_usd))
+            }),
+            (SortField::Model, SortDirection::Descending) => summaries.sort_by(|a, b| {
+                b.model
+                    .cmp(&a.model)
+                    .then_with(|| b.api_value_usd.total_cmp(&a.api_value_usd))
+            }),
+        }
+        summaries
     }
 
     pub fn is_narrow(&self) -> bool {
@@ -1081,22 +1455,46 @@ impl App {
     }
 }
 
+pub fn format_codex_account_label(account_hash: &str) -> String {
+    match account_hash {
+        "unattributed" => "Unattributed".to_string(),
+        "mixed" => "Mixed".to_string(),
+        "ledger_error" => "Ledger error".to_string(),
+        hash => format!("acct {hash}"),
+    }
+}
+
+fn codex_account_sort_rank(account_hash: &str) -> u8 {
+    match account_hash {
+        "mixed" => 1,
+        "unattributed" => 2,
+        "ledger_error" => 3,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ui::widgets::get_provider_shade;
     use super::*;
-    use crate::tui::data::{ModelUsage, TokenBreakdown};
+    use crate::tui::data::{ModelUsage, ThinkingSummary, TokenBreakdown};
+    use std::collections::BTreeSet;
 
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 6);
+        assert_eq!(tabs.len(), 11);
         assert_eq!(tabs[0], Tab::Overview);
         assert_eq!(tabs[1], Tab::Models);
         assert_eq!(tabs[2], Tab::Daily);
         assert_eq!(tabs[3], Tab::Hourly);
-        assert_eq!(tabs[4], Tab::Stats);
-        assert_eq!(tabs[5], Tab::Agents);
+        assert_eq!(tabs[4], Tab::Prices);
+        assert_eq!(tabs[5], Tab::Thinking);
+        assert_eq!(tabs[6], Tab::Speeds);
+        assert_eq!(tabs[7], Tab::Accounts);
+        assert_eq!(tabs[8], Tab::Quota);
+        assert_eq!(tabs[9], Tab::Stats);
+        assert_eq!(tabs[10], Tab::Agents);
     }
 
     #[test]
@@ -1104,7 +1502,12 @@ mod tests {
         assert_eq!(Tab::Overview.next(), Tab::Models);
         assert_eq!(Tab::Models.next(), Tab::Daily);
         assert_eq!(Tab::Daily.next(), Tab::Hourly);
-        assert_eq!(Tab::Hourly.next(), Tab::Stats);
+        assert_eq!(Tab::Hourly.next(), Tab::Prices);
+        assert_eq!(Tab::Prices.next(), Tab::Thinking);
+        assert_eq!(Tab::Thinking.next(), Tab::Speeds);
+        assert_eq!(Tab::Speeds.next(), Tab::Accounts);
+        assert_eq!(Tab::Accounts.next(), Tab::Quota);
+        assert_eq!(Tab::Quota.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
         assert_eq!(Tab::Agents.next(), Tab::Overview);
     }
@@ -1115,7 +1518,12 @@ mod tests {
         assert_eq!(Tab::Models.prev(), Tab::Overview);
         assert_eq!(Tab::Daily.prev(), Tab::Models);
         assert_eq!(Tab::Hourly.prev(), Tab::Daily);
-        assert_eq!(Tab::Stats.prev(), Tab::Hourly);
+        assert_eq!(Tab::Prices.prev(), Tab::Hourly);
+        assert_eq!(Tab::Thinking.prev(), Tab::Prices);
+        assert_eq!(Tab::Speeds.prev(), Tab::Thinking);
+        assert_eq!(Tab::Accounts.prev(), Tab::Speeds);
+        assert_eq!(Tab::Quota.prev(), Tab::Accounts);
+        assert_eq!(Tab::Stats.prev(), Tab::Quota);
         assert_eq!(Tab::Agents.prev(), Tab::Stats);
     }
 
@@ -1125,6 +1533,11 @@ mod tests {
         assert_eq!(Tab::Models.as_str(), "Models");
         assert_eq!(Tab::Agents.as_str(), "Agents");
         assert_eq!(Tab::Daily.as_str(), "Daily");
+        assert_eq!(Tab::Prices.as_str(), "Prices");
+        assert_eq!(Tab::Thinking.as_str(), "Thinking");
+        assert_eq!(Tab::Speeds.as_str(), "Speed");
+        assert_eq!(Tab::Accounts.as_str(), "Accounts");
+        assert_eq!(Tab::Quota.as_str(), "ROI");
         assert_eq!(Tab::Stats.as_str(), "Stats");
     }
 
@@ -1134,6 +1547,11 @@ mod tests {
         assert_eq!(Tab::Models.short_name(), "Mod");
         assert_eq!(Tab::Agents.short_name(), "Agt");
         assert_eq!(Tab::Daily.short_name(), "Day");
+        assert_eq!(Tab::Prices.short_name(), "Prc");
+        assert_eq!(Tab::Thinking.short_name(), "Thk");
+        assert_eq!(Tab::Speeds.short_name(), "Tps");
+        assert_eq!(Tab::Accounts.short_name(), "Acct");
+        assert_eq!(Tab::Quota.short_name(), "ROI");
         assert_eq!(Tab::Stats.short_name(), "Sta");
     }
 
@@ -1400,6 +1818,27 @@ mod tests {
         app
     }
 
+    fn account_usage(account_hash: &str, cost: f64, tokens: u64) -> CodexAccountUsage {
+        CodexAccountUsage {
+            account_hash: account_hash.to_string(),
+            tokens: TokenBreakdown {
+                input: tokens,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            cost,
+            paid_cost: Some(200.0),
+            active_month_count: Some(1),
+            message_count: 1,
+            turn_count: 1,
+            session_count: 1,
+            first_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 1),
+            latest_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 1),
+        }
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1443,6 +1882,21 @@ mod tests {
         assert_eq!(app.current_tab, Tab::Hourly);
 
         app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Prices);
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Thinking);
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Speeds);
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Accounts);
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.current_tab, Tab::Quota);
+
+        app.handle_key_event(key(KeyCode::Tab));
         assert_eq!(app.current_tab, Tab::Stats);
 
         app.handle_key_event(key(KeyCode::Tab));
@@ -1462,6 +1916,21 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Stats);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Quota);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Accounts);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Speeds);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Thinking);
+
+        app.handle_key_event(key(KeyCode::BackTab));
+        assert_eq!(app.current_tab, Tab::Prices);
 
         app.handle_key_event(key(KeyCode::BackTab));
         assert_eq!(app.current_tab, Tab::Hourly);
@@ -1550,6 +2019,142 @@ mod tests {
     }
 
     #[test]
+    fn test_get_sorted_codex_accounts_keeps_real_accounts_above_unattributed_by_cost() {
+        let mut app = make_app();
+        app.sort_field = SortField::Cost;
+        app.sort_direction = SortDirection::Descending;
+        app.data.codex_accounts = vec![
+            account_usage("unattributed", 28_000.0, 70_000),
+            account_usage("real-low", 100.0, 100),
+            account_usage("real-high", 500.0, 500),
+            account_usage("mixed", 600.0, 600),
+        ];
+
+        let accounts = app.get_sorted_codex_accounts();
+        let hashes = accounts
+            .iter()
+            .map(|account| account.account_hash.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            hashes,
+            vec!["real-high", "real-low", "mixed", "unattributed"]
+        );
+    }
+
+    #[test]
+    fn test_get_sorted_codex_accounts_keeps_real_accounts_above_unattributed_by_tokens() {
+        let mut app = make_app();
+        app.sort_field = SortField::Tokens;
+        app.sort_direction = SortDirection::Descending;
+        app.data.codex_accounts = vec![
+            account_usage("unattributed", 1.0, 70_000),
+            account_usage("real-low", 1.0, 100),
+            account_usage("real-high", 1.0, 500),
+        ];
+
+        let accounts = app.get_sorted_codex_accounts();
+        let hashes = accounts
+            .iter()
+            .map(|account| account.account_hash.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(hashes, vec!["real-high", "real-low", "unattributed"]);
+    }
+
+    #[test]
+    fn test_get_sorted_thinking_returns_one_row_per_model_sorted_by_name() {
+        let mut app = make_app();
+        app.sort_field = SortField::Model;
+        app.sort_direction = SortDirection::Ascending;
+        app.data.thinking = vec![
+            ThinkingSummary {
+                model: "gpt-5".to_string(),
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                clients: BTreeSet::new(),
+                message_count: 1,
+                thirty_day_trend_pct: Some(5.0),
+            },
+            ThinkingSummary {
+                model: "claude-sonnet-4".to_string(),
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                clients: BTreeSet::new(),
+                message_count: 1,
+                thirty_day_trend_pct: Some(-3.0),
+            },
+        ];
+
+        let sorted = app.get_sorted_thinking();
+        let summary: Vec<String> = sorted.iter().map(|row| row.model.clone()).collect();
+
+        assert_eq!(
+            summary,
+            vec!["claude-sonnet-4".to_string(), "gpt-5".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_get_sorted_thinking_respects_cost_and_token_sorting() {
+        let mut app = make_app();
+        app.data.thinking = vec![
+            ThinkingSummary {
+                model: "gpt-5".to_string(),
+                tokens: TokenBreakdown {
+                    input: 0,
+                    output: 100,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 50,
+                },
+                cost: 1.0,
+                clients: BTreeSet::new(),
+                message_count: 1,
+                thirty_day_trend_pct: Some(5.0),
+            },
+            ThinkingSummary {
+                model: "claude-sonnet-4".to_string(),
+                tokens: TokenBreakdown {
+                    input: 0,
+                    output: 400,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 100,
+                },
+                cost: 4.0,
+                clients: BTreeSet::new(),
+                message_count: 1,
+                thirty_day_trend_pct: Some(-3.0),
+            },
+        ];
+
+        app.sort_field = SortField::Cost;
+        app.sort_direction = SortDirection::Descending;
+        let by_cost: Vec<String> = app
+            .get_sorted_thinking()
+            .iter()
+            .map(|row| row.model.clone())
+            .collect();
+        assert_eq!(
+            by_cost,
+            vec!["claude-sonnet-4".to_string(), "gpt-5".to_string()]
+        );
+
+        app.sort_field = SortField::Tokens;
+        app.sort_direction = SortDirection::Ascending;
+        let by_tokens: Vec<String> = app
+            .get_sorted_thinking()
+            .iter()
+            .map(|row| row.model.clone())
+            .collect();
+        assert_eq!(
+            by_tokens,
+            vec!["gpt-5".to_string(), "claude-sonnet-4".to_string()]
+        );
+    }
+
+    #[test]
     fn test_handle_key_left_right_switch() {
         let mut app = make_app();
         app.handle_key_event(key(KeyCode::Right));
@@ -1599,6 +2204,16 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_key_sort_d_uses_model_for_thinking_tab() {
+        let mut app = make_app();
+        app.current_tab = Tab::Thinking;
+        app.apply_tab_sort_defaults();
+        app.handle_key_event(key(KeyCode::Char('d')));
+        assert_eq!(app.sort_field, SortField::Model);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+    }
+
+    #[test]
     fn test_handle_key_sort_toggle_direction() {
         let mut app = make_app();
         app.handle_key_event(key(KeyCode::Char('t')));
@@ -1621,6 +2236,11 @@ mod tests {
         assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Models);
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.current_tab = Tab::Thinking;
+        app.apply_tab_sort_defaults();
         assert_eq!(app.sort_field, SortField::Cost);
         assert_eq!(app.sort_direction, SortDirection::Descending);
     }
